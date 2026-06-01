@@ -709,7 +709,7 @@ fn resume_command(row: &SessionRow) -> Option<String> {
     row.id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
-        .map(|id| format!("claude resume {id}"))
+        .map(|id| format!("claude --resume {id}"))
 }
 
 fn dash_empty(value: &str) -> &str {
@@ -934,7 +934,7 @@ mod tests {
 
         assert_eq!(
             resume_command(&rows[0]).as_deref(),
-            Some("claude resume 019e6ce6-08f8-77e0-ba64-f303967970e0")
+            Some("claude --resume 019e6ce6-08f8-77e0-ba64-f303967970e0")
         );
 
         rows[0].id = None;

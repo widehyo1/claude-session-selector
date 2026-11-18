@@ -109,7 +109,7 @@ fn index_help_lists_legacy_recorder_options() {
 }
 
 #[test]
-fn index_creates_schema_v6_with_content_fts() {
+fn index_creates_schema_v1_with_content_fts() {
     let fixture = Fixture::new();
     fixture.write_session("normal.jsonl", "증분 인덱스 확인");
     let output = stdout(fixture.index().output().unwrap());
@@ -122,8 +122,27 @@ fn index_creates_schema_v6_with_content_fts() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        6
+        1
     );
+    let session_columns = conn
+        .prepare("SELECT name FROM pragma_table_info('sessions')")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    for column in [
+        "title",
+        "parent_session_id",
+        "parent_tool_use_id",
+        "agent_type",
+        "continued_in_session_id",
+    ] {
+        assert!(
+            session_columns.iter().any(|name| name == column),
+            "{column}"
+        );
+    }
     assert_eq!(
         conn.query_row("SELECT count(*) FROM sessions_fts", [], |row| row
             .get::<_, i64>(0))
@@ -140,25 +159,14 @@ fn index_creates_schema_v6_with_content_fts() {
 }
 
 #[test]
-fn selector_no_refresh_rejects_schema_v1_with_action() {
+fn selector_no_refresh_rejects_legacy_database_with_action() {
     let fixture = Fixture::new();
-    fixture.write_session("normal.jsonl", "message");
-    stdout(fixture.index().output().unwrap());
     let conn = Connection::open(&fixture.db).unwrap();
     conn.execute_batch(
-        "DROP TRIGGER sessions_fts_dirty_ai;
-         DROP TRIGGER sessions_fts_dirty_au;
-         DROP TRIGGER sessions_fts_dirty_ad;
-         DROP TRIGGER exec_events_fts_dirty_ai;
-         DROP TRIGGER exec_events_fts_dirty_au;
-         DROP TRIGGER exec_events_fts_dirty_ad;
-         DROP TRIGGER message_events_fts_dirty_ai;
-         DROP TRIGGER message_events_fts_dirty_au;
-         DROP TRIGGER message_events_fts_dirty_ad;
-         DROP TABLE sessions_fts;
-         DROP TABLE fts_sync_state;
-         DROP TABLE message_events;
-         PRAGMA user_version = 1;",
+        "CREATE TABLE sessions (
+             path TEXT, id TEXT, timestamp TEXT, cwd TEXT,
+             repository_url TEXT, branch TEXT, first_message TEXT
+         );",
     )
     .unwrap();
     drop(conn);
@@ -174,7 +182,7 @@ fn selector_no_refresh_rejects_schema_v1_with_action() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "search index schema 6 is required; refresh the index or run `select-claude-session index`"
+        "search index schema 1 is required; refresh the index or run `select-claude-session index`"
     ));
 }
 

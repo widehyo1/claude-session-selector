@@ -42,6 +42,35 @@ struct StoredExec {
     event: ExecEvent,
 }
 
+// Number of columns read by `session_row`, in this order:
+// path, id, timestamp, cwd, repository_url, branch, first_message, is_subsession,
+// title, parent_session_id, parent_tool_use_id, agent_type, continued_in_session_id.
+pub(crate) const SESSION_ROW_COLUMNS: usize = 13;
+
+pub(crate) fn session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    session_row_at(row, 0)
+}
+
+fn session_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        path: PathBuf::from(row.get::<_, String>(offset)?),
+        id: row.get(offset + 1)?,
+        timestamp: row.get(offset + 2)?,
+        cwd: row.get(offset + 3)?,
+        repository_url: row.get(offset + 4)?,
+        branch: row.get(offset + 5)?,
+        first_message: row
+            .get::<_, Option<String>>(offset + 6)?
+            .unwrap_or_default(),
+        is_subsession: row.get::<_, i64>(offset + 7)? != 0,
+        title: row.get(offset + 8)?,
+        parent_session_id: row.get(offset + 9)?,
+        parent_tool_use_id: row.get(offset + 10)?,
+        agent_type: row.get(offset + 11)?,
+        continued_in_session_id: row.get(offset + 12)?,
+    })
+}
+
 pub(crate) fn open_configured_connection(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -206,23 +235,15 @@ fn load_session_for_source(tx: &Transaction<'_>, source_key: i64) -> Result<Opti
     Ok(tx
         .query_row(
             "SELECT session_key, path, id, timestamp, cwd, repository_url, branch,
-                    first_message, is_subsession
+                    first_message, is_subsession, title, parent_session_id,
+                    parent_tool_use_id, agent_type, continued_in_session_id
              FROM sessions
              WHERE source_key = ?1",
             params![source_key],
             |row| {
                 Ok(StoredSession {
                     key: row.get(0)?,
-                    row: SessionRow {
-                        path: PathBuf::from(row.get::<_, String>(1)?),
-                        id: row.get(2)?,
-                        timestamp: row.get(3)?,
-                        cwd: row.get(4)?,
-                        repository_url: row.get(5)?,
-                        branch: row.get(6)?,
-                        first_message: row.get(7)?,
-                        is_subsession: row.get::<_, i64>(8)? != 0,
-                    },
+                    row: session_row_at(row, 1)?,
                 })
             },
         )
@@ -233,8 +254,10 @@ fn insert_session(tx: &Transaction<'_>, source_key: i64, row: &SessionRow) -> Re
     Ok(tx.query_row(
         "INSERT INTO sessions(
              path, id, timestamp, cwd, repository_url, branch, first_message,
-             source_key, is_subsession, has_nonempty_first_message
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             source_key, is_subsession, has_nonempty_first_message,
+             title, parent_session_id, parent_tool_use_id, agent_type,
+             continued_in_session_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          RETURNING session_key",
         params![
             row.path.to_string_lossy().as_ref(),
@@ -247,6 +270,11 @@ fn insert_session(tx: &Transaction<'_>, source_key: i64, row: &SessionRow) -> Re
             source_key,
             i64::from(row.is_subsession),
             i64::from(!row.first_message.trim().is_empty()),
+            row.title.as_deref(),
+            row.parent_session_id.as_deref(),
+            row.parent_tool_use_id.as_deref(),
+            row.agent_type.as_deref(),
+            row.continued_in_session_id.as_deref(),
         ],
         |result| result.get(0),
     )?)
@@ -263,8 +291,13 @@ fn update_session(tx: &Transaction<'_>, session_key: i64, row: &SessionRow) -> R
              branch = ?6,
              first_message = ?7,
              is_subsession = ?8,
-             has_nonempty_first_message = ?9
-         WHERE session_key = ?10",
+             has_nonempty_first_message = ?9,
+             title = ?10,
+             parent_session_id = ?11,
+             parent_tool_use_id = ?12,
+             agent_type = ?13,
+             continued_in_session_id = ?14
+         WHERE session_key = ?15",
         params![
             row.path.to_string_lossy().as_ref(),
             row.id.as_deref(),
@@ -275,6 +308,11 @@ fn update_session(tx: &Transaction<'_>, session_key: i64, row: &SessionRow) -> R
             row.first_message.as_str(),
             i64::from(row.is_subsession),
             i64::from(!row.first_message.trim().is_empty()),
+            row.title.as_deref(),
+            row.parent_session_id.as_deref(),
+            row.parent_tool_use_id.as_deref(),
+            row.agent_type.as_deref(),
+            row.continued_in_session_id.as_deref(),
             session_key,
         ],
     )?;
@@ -596,7 +634,8 @@ pub(crate) fn load_sessions_with_view(
     let (sql, arguments): (&str, Vec<i64>) = if canonical {
         (
             "SELECT path, id, timestamp, cwd, repository_url, branch,
-                    first_message, is_subsession
+                    first_message, is_subsession, title, parent_session_id,
+                    parent_tool_use_id, agent_type, continued_in_session_id
              FROM sessions
              WHERE (?1 = 1 OR is_subsession = 0)
                AND (?2 = 1 OR has_nonempty_first_message = 1)
@@ -609,7 +648,7 @@ pub(crate) fn load_sessions_with_view(
     } else {
         (
             "SELECT path, id, timestamp, cwd, repository_url, branch,
-                    first_message, 0
+                    first_message, 0, NULL, NULL, NULL, NULL, NULL
              FROM sessions
              ORDER BY timestamp DESC",
             Vec::new(),
@@ -617,18 +656,7 @@ pub(crate) fn load_sessions_with_view(
     };
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(arguments), |row| {
-            Ok(SessionRow {
-                path: PathBuf::from(row.get::<_, String>(0)?),
-                id: row.get(1)?,
-                timestamp: row.get(2)?,
-                cwd: row.get(3)?,
-                repository_url: row.get(4)?,
-                branch: row.get(5)?,
-                first_message: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                is_subsession: row.get::<_, i64>(7)? != 0,
-            })
-        })?
+        .query_map(rusqlite::params_from_iter(arguments), session_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }

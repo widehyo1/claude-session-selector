@@ -74,39 +74,11 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
         IndexMode::Incremental => store::load_fingerprints(&conn)?,
         IndexMode::Rebuild => BTreeMap::<PathBuf, StoredSource>::new(),
     };
-    let force_all = matches!(
-        state,
-        SchemaState::CanonicalV1 { .. }
-            | SchemaState::FtsV2 { .. }
-            | SchemaState::ContentV3 { .. }
-            | SchemaState::FirstMessageV4 { .. }
-            | SchemaState::FirstMessageV5 { .. }
-    );
-    let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild || force_all)?;
-    if force_all && !plan.unstable_paths.is_empty() {
-        bail!(
-            "cannot migrate index schema to 6 while {} source files are changing; retry the index refresh",
-            plan.unstable_paths.len()
-        );
-    }
+    let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild)?;
 
     let tx = store::begin_immediate(&mut conn)?;
     let fts_mode = match (&state, mode) {
-        (SchemaState::CanonicalV1 { .. } | SchemaState::FtsV2 { .. }, IndexMode::Incremental) => {
-            if matches!(state, SchemaState::FtsV2 { .. }) {
-                fts::drop_schema(&tx)?;
-            }
-            tx.execute_batch("CREATE TABLE message_events (event_index INTEGER NOT NULL CHECK (event_index >= 0), role TEXT NOT NULL CHECK (role IN ('user', 'agent')), content TEXT NOT NULL, message_key INTEGER PRIMARY KEY, session_key INTEGER NOT NULL REFERENCES sessions(session_key) ON DELETE CASCADE, UNIQUE (session_key, event_index)) STRICT;")?;
-            fts::create_schema(&tx)?;
-            fts::FtsSyncMode::Populate
-        }
-        (
-            SchemaState::ContentV3 { .. }
-            | SchemaState::FirstMessageV4 { .. }
-            | SchemaState::FirstMessageV5 { .. }
-            | SchemaState::Current { .. },
-            IndexMode::Incremental,
-        ) => fts::preflight(&tx)?,
+        (SchemaState::Current { .. }, IndexMode::Incremental) => fts::preflight(&tx)?,
         _ => fts::FtsSyncMode::Populate,
     };
     let mut delta = match mode {
@@ -122,7 +94,6 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
     fts::mark_clean(&tx)?;
     let quick_check = options.quick_check
         || mode == IndexMode::Rebuild
-        || force_all
         || fts_mode != fts::FtsSyncMode::Delta
         || !plan.new_sources.is_empty()
         || !plan.changed_sources.is_empty()
@@ -142,22 +113,12 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
 fn choose_mode(state: &SchemaState, root: &Path, rebuild: bool) -> Result<IndexMode> {
     match state {
         SchemaState::Empty | SchemaState::Legacy => Ok(IndexMode::Rebuild),
-        SchemaState::CanonicalV1 { sessions_root }
-        | SchemaState::FtsV2 { sessions_root }
-        | SchemaState::ContentV3 { sessions_root }
-        | SchemaState::FirstMessageV4 { sessions_root }
-        | SchemaState::FirstMessageV5 { sessions_root }
-        | SchemaState::Current { sessions_root }
+        SchemaState::Current { sessions_root }
             if rebuild || sessions_root.to_string_lossy() != root.to_string_lossy() =>
         {
             Ok(IndexMode::Rebuild)
         }
-        SchemaState::CanonicalV1 { .. }
-        | SchemaState::FtsV2 { .. }
-        | SchemaState::ContentV3 { .. }
-        | SchemaState::FirstMessageV4 { .. }
-        | SchemaState::FirstMessageV5 { .. }
-        | SchemaState::Current { .. } => Ok(IndexMode::Incremental),
+        SchemaState::Current { .. } => Ok(IndexMode::Incremental),
         SchemaState::Future { version } => bail!(
             "index schema version {version} is newer than supported version {}; refusing to overwrite it",
             schema::SCHEMA_VERSION
@@ -284,41 +245,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
-        );
-    }
-
-    #[test]
-    fn schema_v5_refreshes_unchanged_sources_for_the_first_message_parser() {
-        let fixture = SessionFixture::new();
-        fixture.write_named_session("session.jsonl", "legacy user request", false);
-        let db = fixture.path("index.sqlite3");
-        build_index(&options(&fixture, db.clone())).unwrap();
-
-        let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
-            "UPDATE sessions
-             SET first_message = '', has_nonempty_first_message = 0;
-             PRAGMA user_version = 5;",
-        )
-        .unwrap();
-        drop(conn);
-
-        let outcome = build_index(&options(&fixture, db.clone())).unwrap();
-        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
-        assert_eq!(outcome.summary.parsed_files, 1);
-
-        let conn = Connection::open(&db).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT first_message FROM sessions", [], |row| row
-                .get::<_, String>(0))
-                .unwrap(),
-            "legacy user request"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .unwrap(),
-            6
+            1
         );
     }
 
@@ -741,39 +668,6 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            6
-        );
-    }
-
-    #[test]
-    fn schema_v1_migrates_without_reparsing_unchanged_sources() {
-        let fixture = SessionFixture::new();
-        fixture.write_session_with_exec();
-        let db = fixture.path("index.sqlite3");
-        let options = options(&fixture, db.clone());
-        build_index(&options).unwrap();
-
-        let mut conn = store::open_configured_connection(&db).unwrap();
-        let tx = store::begin_immediate(&mut conn).unwrap();
-        fts::drop_schema(&tx).unwrap();
-        tx.execute("DROP TABLE message_events", []).unwrap();
-        tx.execute_batch("PRAGMA user_version = 1;").unwrap();
-        tx.commit().unwrap();
-        assert!(matches!(
-            schema::detect_schema(&conn).unwrap(),
-            SchemaState::CanonicalV1 { .. }
-        ));
-        drop(conn);
-
-        let outcome = build_index(&options).unwrap();
-        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
-        assert_eq!(outcome.summary.parsed_files, 1);
-        let index = search::SearchIndex::open(&db, store::SessionView::default()).unwrap();
-        assert_eq!(
-            index
-                .search("read", search::SearchScope::Exec)
-                .unwrap()
-                .len(),
             1
         );
     }
@@ -991,7 +885,7 @@ mod tests {
 
         let future_db = fixture.path("future.sqlite3");
         let conn = Connection::open(&future_db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 7;").unwrap();
+        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
         drop(conn);
         let mut future_options = options(&fixture, future_db);
         future_options.rebuild = true;
@@ -1000,6 +894,87 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("newer")
+        );
+    }
+
+    #[test]
+    fn new_columns_round_trip_through_the_index() {
+        let fixture = SessionFixture::new();
+        let project = fixture.sessions_root().join("-tmp-fixture");
+        let subagents = project.join("main-1").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let main = project.join("main-1.jsonl");
+        let sub = subagents.join("agent-a1.jsonl");
+        fs::write(&main, include_str!("../tests/fixtures/main-session.jsonl")).unwrap();
+        fs::write(
+            &sub,
+            include_str!("../tests/fixtures/subagent/agent-a1.jsonl"),
+        )
+        .unwrap();
+        fs::write(
+            subagents.join("agent-a1.meta.json"),
+            include_str!("../tests/fixtures/subagent/agent-a1.meta.json"),
+        )
+        .unwrap();
+        let db = fixture.path("index.sqlite3");
+        build_index(&options(&fixture, db.clone())).unwrap();
+
+        let mut stored = store::load_sessions_with_view(
+            &db,
+            store::SessionView {
+                include_subsessions: true,
+                include_empty_messages: true,
+            },
+        )
+        .unwrap();
+        stored.sort_by(|left, right| left.path.cmp(&right.path));
+        let parsed = [&sub, &main]
+            .map(|path| crate::parse_session_file(path).unwrap().unwrap())
+            .to_vec();
+        assert_eq!(stored, parsed);
+        assert_eq!(stored[0].parent_session_id.as_deref(), Some("main-1"));
+        assert_eq!(stored[1].title.as_deref(), Some("Parser fix"));
+    }
+
+    #[test]
+    fn meta_only_change_does_not_reparse() {
+        let fixture = SessionFixture::new();
+        let sub = fixture.write_named_session("sub.jsonl", "worker", true);
+        let meta = sub.with_file_name("agent-sub.meta.json");
+        fs::write(&meta, r#"{"description":"before"}"#).unwrap();
+        let db = fixture.path("index.sqlite3");
+        build_index(&options(&fixture, db.clone())).unwrap();
+
+        fs::write(&meta, r#"{"description":"after"}"#).unwrap();
+        let outcome = build_index(&options(&fixture, db.clone())).unwrap();
+        assert_eq!(outcome.summary.parsed_files, 0);
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT title FROM sessions", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "before"
+        );
+    }
+
+    #[test]
+    fn duplicate_records_across_continued_sessions_are_both_indexed() {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("previous.jsonl", "shared prompt", false);
+        fixture.write_named_session("continued.jsonl", "shared prompt", false);
+        let db = fixture.path("index.sqlite3");
+        build_index(&options(&fixture, db.clone())).unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(DISTINCT session_key) FROM message_events
+                 WHERE content = 'shared prompt'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
         );
     }
 

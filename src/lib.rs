@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use serde::Deserialize;
 use serde_json::Value;
 
 use session_event::RecordKind;
@@ -41,7 +42,7 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionRow {
     pub path: PathBuf,
     pub id: Option<String>,
@@ -51,6 +52,11 @@ pub struct SessionRow {
     pub branch: Option<String>,
     pub first_message: String,
     pub is_subsession: bool,
+    pub title: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub parent_tool_use_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub continued_in_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +136,43 @@ pub fn is_subsession_path(path: &Path) -> bool {
     matches!(classify_source(path), Some(SourceKind::Subagent { .. }))
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentMeta {
+    agent_type: Option<String>,
+    description: Option<String>,
+    tool_use_id: Option<String>,
+}
+
+// `agent-<id>.jsonl` is described by the sibling `agent-<id>.meta.json`.
+// A missing file is normal; a broken one is reported and ignored.
+fn read_subagent_meta(jsonl_path: &Path) -> SubagentMeta {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    let contents = match fs::read_to_string(&meta_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return SubagentMeta::default(),
+        Err(err) => {
+            eprintln!("warning: {}: {err}", meta_path.display());
+            return SubagentMeta::default();
+        }
+    };
+    match serde_json::from_str::<SubagentMeta>(&contents) {
+        Ok(meta) => SubagentMeta {
+            agent_type: nonblank(meta.agent_type),
+            description: nonblank(meta.description),
+            tool_use_id: nonblank(meta.tool_use_id),
+        },
+        Err(err) => {
+            eprintln!("warning: {}: invalid json: {err}", meta_path.display());
+            SubagentMeta::default()
+        }
+    }
+}
+
+fn nonblank(value: Option<String>) -> Option<String> {
+    value.filter(|text| !text.trim().is_empty())
+}
+
 pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
     Ok(parse_session_file_data(path, false)?.map(|data| data.row))
 }
@@ -140,6 +183,9 @@ struct SessionMeta {
     cwd: Option<String>,
     branch: Option<String>,
     repository_url: Option<String>,
+    ai_title: Option<String>,
+    agent_name: Option<String>,
+    continued_in: Option<String>,
 }
 
 impl SessionMeta {
@@ -184,9 +230,6 @@ pub(crate) fn parse_session_file_data(
                 continue;
             }
         };
-        if !matches!(kind, RecordKind::User | RecordKind::Assistant) {
-            continue;
-        }
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(err) => {
@@ -194,6 +237,21 @@ pub(crate) fn parse_session_file_data(
                 continue;
             }
         };
+        match kind {
+            RecordKind::AiTitle => {
+                set_last(&mut meta.ai_title, &value, "aiTitle");
+                continue;
+            }
+            RecordKind::AgentName => {
+                set_last(&mut meta.agent_name, &value, "agentName");
+                continue;
+            }
+            RecordKind::ContinuedIn => {
+                set_last(&mut meta.continued_in, &value, "continuedInSessionId");
+                continue;
+            }
+            RecordKind::User | RecordKind::Assistant | RecordKind::Other => {}
+        }
 
         seen_conversation = true;
         meta.observe(&value);
@@ -233,16 +291,25 @@ pub(crate) fn parse_session_file_data(
         return Ok(None);
     }
 
-    let (id, is_subsession) = match classify_source(path) {
-        Some(SourceKind::Subagent { agent_id, .. }) => (agent_id, true),
-        Some(SourceKind::Main { session_id }) => (session_id, false),
+    let (id, parent_session_id) = match classify_source(path) {
+        Some(SourceKind::Subagent {
+            agent_id,
+            parent_session_id,
+        }) => (agent_id, Some(parent_session_id)),
+        Some(SourceKind::Main { session_id }) => (session_id, None),
         None => (
             path.file_stem()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned(),
-            false,
+            None,
         ),
+    };
+    let is_subsession = parent_session_id.is_some();
+    let subagent = if is_subsession {
+        read_subagent_meta(path)
+    } else {
+        SubagentMeta::default()
     };
     let row = SessionRow {
         path: path.to_path_buf(),
@@ -255,6 +322,19 @@ pub(crate) fn parse_session_file_data(
             .map(|(_, candidate)| candidate.content)
             .unwrap_or_default(),
         is_subsession,
+        title: if is_subsession {
+            subagent.description
+        } else {
+            meta.ai_title.or(meta.agent_name)
+        },
+        parent_session_id,
+        parent_tool_use_id: subagent.tool_use_id,
+        agent_type: subagent.agent_type,
+        continued_in_session_id: if is_subsession {
+            None
+        } else {
+            meta.continued_in
+        },
     };
     for event in &mut exec_events {
         event.session_id = row.id.clone();
@@ -278,6 +358,13 @@ fn warn_invalid_json(path: &Path, line_number: usize, err: &serde_json::Error) {
 fn set_first(target: &mut Option<String>, value: &Value, field: &str) {
     if target.is_none() {
         *target = nonblank_string_field(value, field);
+    }
+}
+
+// Keeps the last non-blank string value; title records are rewritten every turn.
+fn set_last(target: &mut Option<String>, value: &Value, field: &str) {
+    if let Some(text) = nonblank_string_field(value, field) {
+        *target = Some(text);
     }
 }
 
@@ -351,6 +438,8 @@ pub fn session_date(row: &SessionRow) -> String {
 pub fn searchable_text(row: &SessionRow) -> String {
     [
         row.first_message.as_str(),
+        row.title.as_deref().unwrap_or_default(),
+        row.agent_type.as_deref().unwrap_or_default(),
         row.cwd.as_deref().unwrap_or_default(),
         row.repository_url.as_deref().unwrap_or_default(),
         row.branch.as_deref().unwrap_or_default(),
@@ -627,13 +716,8 @@ mod tests {
     fn row(path: &str, first_message: &str) -> SessionRow {
         SessionRow {
             path: PathBuf::from(path),
-            id: None,
-            timestamp: None,
-            cwd: None,
-            repository_url: None,
-            branch: None,
             first_message: first_message.to_string(),
-            is_subsession: false,
+            ..SessionRow::default()
         }
     }
 
@@ -696,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn main_session_row_uses_first_values() {
+    fn main_session_row_uses_first_values_and_last_title() {
         let layout = layout();
         let row = parse_session_file(&layout.main).unwrap().unwrap();
 
@@ -708,10 +792,30 @@ mod tests {
         assert_eq!(row.repository_url.as_deref(), Some("git.example/team/repo"));
         assert_eq!(row.first_message, "fix the parser");
         assert!(!row.is_subsession);
+        assert_eq!(row.title.as_deref(), Some("Parser fix"));
+        assert_eq!(row.continued_in_session_id.as_deref(), Some("main-2"));
+        assert_eq!(row.parent_session_id, None);
+        assert_eq!(row.parent_tool_use_id, None);
+        assert_eq!(row.agent_type, None);
     }
 
     #[test]
-    fn subagent_row_reads_path() {
+    fn agent_name_is_the_title_fallback() {
+        let layout = layout();
+        let without_ai_title: String = MAIN
+            .lines()
+            .filter(|line| !line.contains("\"ai-title\""))
+            .chain(["{\"type\":\"agent-name\",\"agentName\":\"Named session\"}"])
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&layout.main, without_ai_title).unwrap();
+
+        let row = parse_session_file(&layout.main).unwrap().unwrap();
+        assert_eq!(row.title.as_deref(), Some("Named session"));
+    }
+
+    #[test]
+    fn subagent_row_reads_path_and_meta() {
         let layout = layout();
         let row = parse_session_file(&layout.sub).unwrap().unwrap();
 
@@ -719,6 +823,29 @@ mod tests {
         assert!(row.is_subsession);
         assert_eq!(row.first_message, "count the files");
         assert_eq!(row.cwd.as_deref(), Some("/tmp/fixture"));
+        assert_eq!(row.parent_session_id.as_deref(), Some("main-1"));
+        assert_eq!(row.parent_tool_use_id.as_deref(), Some("toolu_parent"));
+        assert_eq!(row.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(row.title.as_deref(), Some("Count files"));
+        assert_eq!(row.continued_in_session_id, None);
+    }
+
+    #[test]
+    fn missing_or_broken_meta_leaves_columns_empty() {
+        let layout = layout();
+        let meta = layout.sub.with_file_name("agent-a1.meta.json");
+        for contents in [None, Some("{")] {
+            match contents {
+                None => fs::remove_file(&meta).unwrap(),
+                Some(contents) => fs::write(&meta, contents).unwrap(),
+            }
+            let row = parse_session_file(&layout.sub).unwrap().unwrap();
+            assert!(row.is_subsession);
+            assert_eq!(row.parent_session_id.as_deref(), Some("main-1"));
+            assert_eq!(row.title, None);
+            assert_eq!(row.parent_tool_use_id, None);
+            assert_eq!(row.agent_type, None);
+        }
     }
 
     #[test]
@@ -876,6 +1003,30 @@ mod tests {
         assert_eq!(
             filter_sessions(&rows, "2026-05-28")[0].path,
             PathBuf::from("/tmp/b.jsonl")
+        );
+    }
+
+    #[test]
+    fn searchable_text_includes_title_and_agent_type() {
+        let mut titled = row("/tmp/a.jsonl", "first");
+        titled.title = Some("Parser fix".to_string());
+        let mut typed = row("/tmp/b.jsonl", "second");
+        typed.agent_type = Some("general-purpose".to_string());
+        let rows = vec![titled, typed];
+
+        assert_eq!(
+            filter_sessions(&rows, "parser fix")
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/tmp/a.jsonl")]
+        );
+        assert_eq!(
+            filter_sessions(&rows, "general-purpose")
+                .iter()
+                .map(|row| row.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/tmp/b.jsonl")]
         );
     }
 

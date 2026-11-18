@@ -1,9 +1,4 @@
-use std::{
-    error::Error,
-    fmt,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{error::Error, fmt, path::Path, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, params};
@@ -13,7 +8,7 @@ use crate::SessionRow;
 use super::{
     fts,
     schema::{self, SchemaState},
-    store::SessionView,
+    store::{self, SessionView},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,16 +214,11 @@ impl SearchIndex {
         fts::verify_runtime(&conn)?;
         match schema::detect_schema(&conn)? {
             SchemaState::Current { .. } => {}
-            SchemaState::Empty
-            | SchemaState::Legacy
-            | SchemaState::CanonicalV1 { .. }
-            | SchemaState::FtsV2 { .. }
-            | SchemaState::ContentV3 { .. }
-            | SchemaState::FirstMessageV4 { .. }
-            | SchemaState::FirstMessageV5 { .. }
-            | SchemaState::Unknown { version: 0..=5, .. } => bail!(
-                "search index schema 6 is required; refresh the index or run `select-claude-session index`"
-            ),
+            SchemaState::Empty | SchemaState::Legacy | SchemaState::Unknown { version: 0, .. } => {
+                bail!(
+                    "search index schema 1 is required; refresh the index or run `select-claude-session index`"
+                )
+            }
             SchemaState::Future { version } => bail!(
                 "index schema version {version} is newer than supported version {}; refusing to open it",
                 schema::SCHEMA_VERSION
@@ -268,7 +258,9 @@ impl SearchIndex {
         let mut stmt = self.conn.prepare(
             "SELECT
                  s.path, s.id, s.timestamp, s.cwd, s.repository_url, s.branch,
-                 s.first_message, s.is_subsession, sessions_fts.rank
+                 s.first_message, s.is_subsession, s.title, s.parent_session_id,
+                 s.parent_tool_use_id, s.agent_type, s.continued_in_session_id,
+                 sessions_fts.rank
              FROM sessions_fts
              JOIN sessions AS s ON s.session_key = sessions_fts.rowid
              WHERE sessions_fts MATCH ?1
@@ -297,7 +289,8 @@ impl SearchIndex {
     fn query_unranked(&self) -> Result<Vec<SearchHit>> {
         let mut stmt = self.conn.prepare(
             "SELECT path, id, timestamp, cwd, repository_url, branch,
-                    first_message, is_subsession
+                    first_message, is_subsession, title, parent_session_id,
+                    parent_tool_use_id, agent_type, continued_in_session_id
              FROM sessions
              WHERE (?1 = 1 OR is_subsession = 0)
                AND (?2 = 1 OR has_nonempty_first_message = 1)
@@ -310,7 +303,7 @@ impl SearchIndex {
             ],
             |row| {
                 Ok(SearchHit {
-                    row: map_session_row(row)?,
+                    row: store::session_row(row)?,
                     rank: 0.0,
                 })
             },
@@ -321,21 +314,8 @@ impl SearchIndex {
 
 fn map_ranked_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     Ok(SearchHit {
-        row: map_session_row(row)?,
-        rank: row.get(8)?,
-    })
-}
-
-fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
-    Ok(SessionRow {
-        path: PathBuf::from(row.get::<_, String>(0)?),
-        id: row.get(1)?,
-        timestamp: row.get(2)?,
-        cwd: row.get(3)?,
-        repository_url: row.get(4)?,
-        branch: row.get(5)?,
-        first_message: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
-        is_subsession: row.get::<_, i64>(7)? != 0,
+        row: store::session_row(row)?,
+        rank: row.get(store::SESSION_ROW_COLUMNS)?,
     })
 }
 

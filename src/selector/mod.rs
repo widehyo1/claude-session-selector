@@ -839,6 +839,7 @@ mod tests {
                 branch: Some("main".to_string()),
                 first_message: "Fix README parser".to_string(),
                 is_subsession: false,
+                ..SessionRow::default()
             },
             SessionRow {
                 path: PathBuf::from("/tmp/b.jsonl"),
@@ -849,6 +850,7 @@ mod tests {
                 branch: Some("feature/search".to_string()),
                 first_message: "add selector".to_string(),
                 is_subsession: false,
+                ..SessionRow::default()
             },
         ]
     }

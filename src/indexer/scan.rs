@@ -187,7 +187,7 @@ mod tests {
         let unchanged = fixture.write_session_with_exec();
         let changed = fixture.write_named_session("changed.jsonl", "before", false);
         let new = fixture.write_named_session("new.jsonl", "new", false);
-        let deleted = fixture.sessions_root().join("2026/07/26/deleted.jsonl");
+        let deleted = fixture.project_dir().join("deleted.jsonl");
         let stored = BTreeMap::from([
             (
                 unchanged.clone(),
@@ -240,9 +240,8 @@ mod tests {
     #[test]
     fn hard_file_error_aborts_scan() {
         let fixture = SessionFixture::new();
-        let day = fixture.sessions_root().join("2026/07/26");
-        fs::create_dir_all(&day).unwrap();
-        symlink(day.join("missing-target"), day.join("broken.jsonl")).unwrap();
+        let project = fixture.project_dir();
+        symlink(project.join("missing-target"), project.join("broken.jsonl")).unwrap();
         let error = scan_sources(&fixture.sessions_root(), &BTreeMap::new(), false).unwrap_err();
         assert!(error.to_string().contains("metadata"));
     }

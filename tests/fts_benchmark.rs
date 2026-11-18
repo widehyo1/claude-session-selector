@@ -114,7 +114,7 @@ fn fts_release_benchmark() {
 fn run_corpus(size: usize) -> Measurements {
     let root = BenchRoot::new(size);
     let sessions_root = root.path.join("sessions");
-    let day = sessions_root.join("2026/07/27");
+    let day = sessions_root.join("-workspace");
     fs::create_dir_all(&day).unwrap();
     for index in 0..size {
         write_session(&day.join(format!("session-{index:05}.jsonl")), index, false);
@@ -186,53 +186,55 @@ fn run_corpus(size: usize) -> Measurements {
 
 fn write_session(path: &Path, index: usize, changed: bool) {
     let marker = if changed { " changed" } else { "" };
-    let mut records = vec![
+    let timestamp = format!("2026-07-{:02}T01:02:03Z", index % 28 + 1);
+    let human = |message: String| {
         json!({
-            "type": "session_meta",
-            "payload": {
-                "id": format!("benchmark-{index}"),
-                "timestamp": format!("2026-07-{:02}T01:02:03Z", index % 28 + 1),
-                "cwd": format!("/workspace/team-{}/project-{index}", index % 100),
-                "source": "cli",
-                "thread_source": "user",
-                "git": {
-                    "repository_url": format!("https://github.com/bench/repo-{}.git", index % 1000),
-                    "branch": format!("feature/batch-{}", index % 10)
-                }
-            }
-        }),
-        json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": format!("session benchmark item{index} 검색기능{marker}")
-            }
-        }),
-    ];
+            "type": "user",
+            "isSidechain": false,
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "message": {"role": "user", "content": message},
+            "timestamp": timestamp,
+            "cwd": format!("/workspace/team-{}/project-{index}", index % 100),
+            "gitBranch": format!("feature/batch-{}", index % 10)
+        })
+    };
+    let mut records = vec![human(format!(
+        "session benchmark item{index} 검색기능{marker}"
+    ))];
     for event in 0..6 {
+        records.push(human(format!(
+            "user benchmark item{index} event{event} 검색기능{marker}"
+        )));
         records.push(json!({
-            "type": "event_msg",
-            "payload": { "type": "user_message", "message": format!("user benchmark item{index} event{event} 검색기능{marker}") }
-        }));
-        records.push(json!({
-            "type": "event_msg",
-            "payload": { "type": "agent_message", "message": format!("agent benchmark item{index} event{event} response{marker}") }
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "claude-bench", "content": [
+                {"type": "text", "text": format!("agent benchmark item{index} event{event} response{marker}")}
+            ]}
         }));
     }
     for event in 0..2 {
+        let call_id = format!("toolu_{index}_{event}");
         records.push(json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "exec_command_end",
-                "parsed_cmd": [{
-                    "type": "unknown",
-                    "cmd": format!("cargo test target{index} event{event} {}", "c".repeat(80))
-                }],
-                "aggregated_output": format!(
-                    "needle{index} result{event}{marker} {}",
-                    "x".repeat(1024)
-                )
-            }
+            "type": "assistant",
+            "message": {"role": "assistant", "model": "claude-bench", "content": [{
+                "type": "tool_use",
+                "id": call_id,
+                "name": "Bash",
+                "input": {"command": format!("cargo test target{index} event{event} {}", "c".repeat(80))}
+            }]}
+        }));
+        records.push(json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": format!("needle{index} result{event}{marker} {}", "x".repeat(1024))
+            }]},
+            "serverClassifierContext": {"context": {"git_state": {"visibility": {"origin": {
+                "host": "github.com",
+                "remote": format!("bench/repo-{}", index % 1000)
+            }}}}}
         }));
     }
     let contents = records

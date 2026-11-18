@@ -1,0 +1,15 @@
+{"type":"mode","mode":"normal","sessionId":"main-1"}
+{"type":"api-request-blob","message":{"role":"user","content":"blob must be ignored"}}
+{"type":"user","isSidechain":false,"isMeta":true,"message":{"role":"user","content":"<system-reminder>ignore</system-reminder>"},"timestamp":"2026-11-01T00:00:00.000Z","cwd":"/tmp/fixture","gitBranch":"main"}
+{"type":"user","isSidechain":false,"origin":{"kind":"human"},"message":{"role":"user","content":"<command-message>init</command-message>"},"timestamp":"2026-11-01T00:00:01.000Z","cwd":"/tmp/fixture","gitBranch":"main"}
+{"type":"user","isSidechain":false,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"fix the parser"},"timestamp":"2026-11-01T00:00:02.000Z","cwd":"/tmp/other","gitBranch":"feature"}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","model":"claude-test","content":[{"type":"thinking","thinking":"hidden"}]},"timestamp":"2026-11-01T00:00:03.000Z"}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","model":"claude-test","content":[{"type":"text","text":"checking status"}]},"timestamp":"2026-11-01T00:00:04.000Z"}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","model":"claude-test","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"git status","description":"status"}}]},"timestamp":"2026-11-01T00:00:05.000Z"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"clean","is_error":false}]},"toolUseResult":{"stdout":"clean","stderr":""},"serverClassifierContext":{"context":{"git_state":{"visibility":{"origin":{"host":"git.example","remote":"team/repo","visibility":"unknown"}}}}},"timestamp":"2026-11-01T00:00:06.000Z"}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","model":"claude-test","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/tmp/a"}}]},"timestamp":"2026-11-01T00:00:07.000Z"}
+{"type":"user","isSidechain":false,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_2","content":[{"type":"text","text":"file body"}]}]},"timestamp":"2026-11-01T00:00:08.000Z"}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]},"timestamp":"2026-11-01T00:00:09.000Z"}
+{"type":"ai-title","aiTitle":"old title","sessionId":"main-1"}
+{"type":"ai-title","aiTitle":"Parser fix","sessionId":"main-1"}
+{"type":"continued-in","sessionId":"main-1","continuedInSessionId":"main-2","timestamp":"2026-11-01T00:01:00.000Z"}

@@ -229,7 +229,7 @@ fn root_help() -> String {
         "\
 select-claude-session {version}
 
-Open a TUI for choosing a local Codex session and replaying its JSONL timeline.
+Open a TUI for choosing a local Claude Code session and replaying its JSONL timeline.
 
 Usage:
   select-claude-session [SELECTOR_OPTIONS]
@@ -279,7 +279,7 @@ fn index_help() -> String {
         "\
 select-claude-session {version}
 
-Build a SQLite index from local Codex session JSONL files.
+Build a SQLite index from local Claude Code session JSONL files.
 
 Usage:
   select-claude-session index [INDEX_OPTIONS]
@@ -287,7 +287,7 @@ Usage:
 Options:
   -o, --output PATH              SQLite output path
                                  default: ~/claude-session-info.sqlite3
-      --sessions-root PATH       Codex sessions root
+      --sessions-root PATH       Claude Code projects root
                                  default: ~/.claude/projects
       --include-subsessions      Compatibility option; canonical index always stores subsessions
       --include-empty-messages   Compatibility option; canonical index always stores empty messages
@@ -308,7 +308,7 @@ fn replay_help() -> String {
         "\
 select-claude-session {version}
 
-Replay a Codex session JSONL file in a terminal UI.
+Replay a Claude Code session JSONL file in a terminal UI.
 
 Usage:
   select-claude-session replay [REPLAY_OPTIONS] [PATH|-]
@@ -320,7 +320,7 @@ Options:
   -V, --version          Show version
 
 Input:
-  PATH    Raw Codex JSONL file or a JSON array of preprocessed events
+  PATH    Raw Claude Code JSONL file or a JSON array of preprocessed events
   -       Read JSONL/JSON from stdin
   omitted Read JSONL/JSON from stdin
 

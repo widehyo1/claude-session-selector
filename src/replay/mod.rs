@@ -9,80 +9,15 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
-use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     cli::ReplayOptions,
-    session_event::{MessageRole, normalize_message_record},
+    session_event::{self, MessageRole},
     terminal,
     ui::{bottom_scroll_offset, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
 };
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type")]
-enum PayloadEvent {
-    #[serde(rename = "user_message")]
-    UserMessage {
-        message: String,
-        #[serde(default)]
-        phase: Option<String>,
-    },
-
-    #[serde(rename = "agent_message")]
-    AgentMessage {
-        message: String,
-        #[serde(default)]
-        phase: Option<String>,
-    },
-
-    #[serde(rename = "exec_command_end")]
-    ExecCommandEnd {
-        #[serde(default)]
-        parsed_cmd: Vec<ParsedCmd>,
-        #[serde(default)]
-        aggregated_output: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RawRecord {
-    #[serde(default)]
-    r#type: Option<String>,
-
-    #[serde(default)]
-    payload: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ParsedCmd {
-    #[serde(default)]
-    r#type: Option<String>,
-
-    #[serde(default)]
-    cmd: String,
-
-    #[serde(default)]
-    name: Option<String>,
-
-    #[serde(default)]
-    path: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-enum NormalizedEvent {
-    Payload(PayloadEvent),
-    ExecToolCall {
-        call_id: Option<String>,
-        kind: String,
-        name: String,
-        input: String,
-    },
-    ExecToolOutput {
-        call_id: Option<String>,
-        output: String,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
@@ -519,45 +454,30 @@ fn load_entries_from_str(input: &str) -> Result<Vec<Entry>> {
         return Ok(Vec::new());
     }
 
-    let values = parse_json_values(trimmed)?;
+    Ok(load_entries(parse_json_values(trimmed)?))
+}
+
+// Messages come before the Bash calls of the same record; results attach to their call.
+fn load_entries(values: Vec<Value>) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut exec_by_call_id: HashMap<String, usize> = HashMap::new();
 
     for value in values {
-        let Some(event) = normalize_record(value)? else {
-            continue;
-        };
-
-        match event {
-            NormalizedEvent::Payload(event) => {
-                entries.push(to_entry(event));
-            }
-            NormalizedEvent::ExecToolCall {
-                call_id,
-                kind,
-                name,
-                input,
-            } => {
-                let index = entries.len();
-                let entry = to_exec_tool_entry(call_id.clone(), &kind, &name, &input);
-                entries.push(entry);
-                if let Some(call_id) = call_id {
-                    exec_by_call_id.insert(call_id, index);
-                }
-            }
-            NormalizedEvent::ExecToolOutput { call_id, output } => {
-                if let Some(index) = call_id
-                    .as_deref()
-                    .and_then(|call_id| exec_by_call_id.get(call_id))
-                    .copied()
-                {
-                    append_exec_output(&mut entries[index], &output);
-                }
+        if let Some(message) = session_event::normalize_message_record(&value) {
+            entries.push(message_entry(message.role, message.content));
+        }
+        for call in session_event::bash_calls(&value) {
+            exec_by_call_id.insert(call.call_id.clone(), entries.len());
+            entries.push(bash_entry(&call.call_id, &call.command));
+        }
+        for output in session_event::tool_outputs(&value) {
+            if let Some(&index) = exec_by_call_id.get(&output.call_id) {
+                append_exec_output(&mut entries[index], &output.output);
             }
         }
     }
 
-    Ok(entries)
+    entries
 }
 
 fn visible_entry_indices(entries: &[Entry], visibility: ExecVisibility) -> Vec<usize> {
@@ -571,14 +491,13 @@ fn visible_entry_indices(entries: &[Entry], visibility: ExecVisibility) -> Vec<u
         .collect()
 }
 
-fn parse_json_values(input: &str) -> Result<Vec<serde_json::Value>> {
+fn parse_json_values(input: &str) -> Result<Vec<Value>> {
     if input.starts_with('[') {
-        let values: Vec<serde_json::Value> =
-            serde_json::from_str(input).context("invalid json array input")?;
+        let values: Vec<Value> = serde_json::from_str(input).context("invalid json array input")?;
         return Ok(values);
     }
 
-    let stream = serde_json::Deserializer::from_str(input).into_iter::<serde_json::Value>();
+    let stream = serde_json::Deserializer::from_str(input).into_iter::<Value>();
 
     let mut values = Vec::new();
 
@@ -589,179 +508,30 @@ fn parse_json_values(input: &str) -> Result<Vec<serde_json::Value>> {
     Ok(values)
 }
 
-fn normalize_record(value: serde_json::Value) -> Result<Option<NormalizedEvent>> {
-    if let Some(message) = normalize_message_record(&value) {
-        let event = match message.role {
-            MessageRole::User => PayloadEvent::UserMessage {
-                message: message.content,
-                phase: message.phase,
-            },
-            MessageRole::Agent => PayloadEvent::AgentMessage {
-                message: message.content,
-                phase: message.phase,
-            },
-        };
-        return Ok(Some(NormalizedEvent::Payload(event)));
-    }
-    if let Ok(event) = serde_json::from_value::<PayloadEvent>(value.clone()) {
-        return Ok(Some(NormalizedEvent::Payload(event)));
-    }
-
-    let raw: RawRecord = serde_json::from_value(value).context("invalid top-level codex record")?;
-
-    match raw.r#type.as_deref() {
-        Some("event_msg") => {
-            let Some(payload) = raw.payload else {
-                return Ok(None);
-            };
-
-            match serde_json::from_value::<PayloadEvent>(payload) {
-                Ok(event) => Ok(Some(NormalizedEvent::Payload(event))),
-                Err(_) => Ok(None),
-            }
-        }
-
-        Some("response_item") => {
-            let Some(payload) = raw.payload else {
-                return Ok(None);
-            };
-            Ok(normalize_response_item(&payload))
-        }
-
-        _ => Ok(None),
+fn message_entry(role: MessageRole, content: String) -> Entry {
+    let (kind, summary) = match role {
+        MessageRole::User => (EntryKind::User, "USER"),
+        MessageRole::Agent => (EntryKind::Agent, "AGENT"),
+    };
+    Entry {
+        kind,
+        summary: summary.to_string(),
+        detail: content,
     }
 }
 
-fn normalize_response_item(payload: &serde_json::Value) -> Option<NormalizedEvent> {
-    match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => {
-            let role = payload.get("role").and_then(serde_json::Value::as_str)?;
-            let message = value_text(payload.get("content").unwrap_or(&serde_json::Value::Null));
-            let phase = string_field(payload, "phase");
-
-            match role {
-                "user" => Some(NormalizedEvent::Payload(PayloadEvent::UserMessage {
-                    message,
-                    phase,
-                })),
-                "assistant" => Some(NormalizedEvent::Payload(PayloadEvent::AgentMessage {
-                    message,
-                    phase,
-                })),
-                _ => None,
-            }
-        }
-        Some("custom_tool_call") | Some("function_call") if is_exec_tool_call(payload) => {
-            Some(NormalizedEvent::ExecToolCall {
-                call_id: string_field(payload, "call_id"),
-                kind: payload
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("tool_call")
-                    .to_string(),
-                name: string_field(payload, "name").unwrap_or_else(|| "exec".to_string()),
-                input: exec_tool_input(payload),
-            })
-        }
-        Some("custom_tool_call_output") | Some("function_call_output") => {
-            Some(NormalizedEvent::ExecToolOutput {
-                call_id: string_field(payload, "call_id"),
-                output: value_text(payload.get("output").unwrap_or(&serde_json::Value::Null)),
-            })
-        }
-        _ => None,
-    }
-}
-
-fn is_exec_tool_call(payload: &serde_json::Value) -> bool {
-    matches!(
-        payload.get("name").and_then(serde_json::Value::as_str),
-        Some("exec") | Some("exec_command")
-    )
-}
-
-fn exec_tool_input(payload: &serde_json::Value) -> String {
-    let input = value_text(payload.get("input").unwrap_or(&serde_json::Value::Null));
-    if input.trim().is_empty() {
-        value_text(payload.get("arguments").unwrap_or(&serde_json::Value::Null))
-    } else {
-        input
-    }
-}
-
-fn to_entry(event: PayloadEvent) -> Entry {
-    match event {
-        PayloadEvent::UserMessage { message, phase } => Entry {
-            kind: EntryKind::User,
-            summary: format!("USER{}", phase_suffix(phase.as_deref())),
-            detail: message,
-        },
-
-        PayloadEvent::AgentMessage { message, phase } => Entry {
-            kind: EntryKind::Agent,
-            summary: format!("AGENT{}", phase_suffix(phase.as_deref())),
-            detail: message,
-        },
-
-        PayloadEvent::ExecCommandEnd {
-            parsed_cmd,
-            aggregated_output,
-        } => {
-            let command_summary = parsed_cmd
-                .iter()
-                .map(format_cmd_summary)
-                .collect::<Vec<_>>()
-                .join(" && ");
-
-            let mut detail = String::new();
-
-            if !parsed_cmd.is_empty() {
-                detail.push_str("COMMANDS\n");
-                detail.push_str("--------\n");
-                for cmd in &parsed_cmd {
-                    detail.push_str(&format_cmd_detail(cmd));
-                    detail.push('\n');
-                }
-                detail.push('\n');
-            }
-
-            detail.push_str("OUTPUT\n");
-            detail.push_str("------\n");
-            detail.push_str(&aggregated_output);
-
-            Entry {
-                kind: EntryKind::Exec,
-                summary: format!("EXEC {command_summary}"),
-                detail,
-            }
-        }
-    }
-}
-
-fn to_exec_tool_entry(call_id: Option<String>, kind: &str, name: &str, input: &str) -> Entry {
-    let command = extract_exec_command(input).unwrap_or_else(|| input.to_string());
+fn bash_entry(call_id: &str, command: &str) -> Entry {
     let command_summary = truncate(&command.replace('\n', " "), 80);
     let mut detail = String::new();
 
     detail.push_str("COMMANDS\n");
     detail.push_str("--------\n");
-    detail.push_str(&format!("type: {kind} | name: {name}"));
-    if let Some(call_id) = call_id.as_deref() {
-        detail.push_str(&format!(" | call_id: {call_id}"));
-    }
-    detail.push('\n');
+    detail.push_str(&format!(
+        "type: tool_use | name: Bash | call_id: {call_id}\n"
+    ));
     detail.push_str("$ ");
-    detail.push_str(&command);
+    detail.push_str(command);
     detail.push('\n');
-
-    if command != input {
-        detail.push('\n');
-        detail.push_str("RAW INPUT\n");
-        detail.push_str("---------\n");
-        detail.push_str(input);
-        detail.push('\n');
-    }
-
     detail.push('\n');
     detail.push_str("OUTPUT\n");
     detail.push_str("------\n");
@@ -779,127 +549,6 @@ fn display_title(visible_index: usize, entry: &Entry) -> String {
 
 fn append_exec_output(entry: &mut Entry, output: &str) {
     entry.detail.push_str(output);
-}
-
-fn phase_suffix(phase: Option<&str>) -> String {
-    match phase {
-        Some(phase) if !phase.is_empty() => format!(" [{phase}]"),
-        _ => String::new(),
-    }
-}
-
-fn string_field(value: &serde_json::Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn value_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::String(value) => value.clone(),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(value_text)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        serde_json::Value::Object(object) => object
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| object.get("output").and_then(serde_json::Value::as_str))
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| value.to_string()),
-        _ => value.to_string(),
-    }
-}
-
-fn extract_exec_command(input: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(input)
-        && let Some(cmd) = value.get("cmd").and_then(serde_json::Value::as_str)
-    {
-        return Some(cmd.to_string());
-    }
-
-    let marker = "tools.exec_command(";
-    let start = input.find(marker)? + marker.len();
-    let json_object = json_object_at(&input[start..])?;
-    serde_json::from_str::<serde_json::Value>(json_object)
-        .ok()?
-        .get("cmd")
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn json_object_at(input: &str) -> Option<&str> {
-    let start = input.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (offset, ch) in input[start..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-
-        match ch {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(&input[start..start + offset + ch.len_utf8()]);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn format_cmd_summary(cmd: &ParsedCmd) -> String {
-    if let Some(name) = &cmd.name
-        && !name.is_empty()
-    {
-        return name.clone();
-    }
-
-    if let Some(path) = &cmd.path
-        && !path.is_empty()
-    {
-        return path.clone();
-    }
-
-    let one_line = cmd.cmd.replace('\n', " ");
-    truncate(&one_line, 80)
-}
-
-fn format_cmd_detail(cmd: &ParsedCmd) -> String {
-    let mut parts = Vec::new();
-
-    if let Some(kind) = &cmd.r#type {
-        parts.push(format!("type: {kind}"));
-    }
-
-    if let Some(name) = &cmd.name {
-        parts.push(format!("name: {name}"));
-    }
-
-    if let Some(path) = &cmd.path {
-        parts.push(format!("path: {path}"));
-    }
-
-    let meta = if parts.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", parts.join(" | "))
-    };
-
-    format!("{meta}$ {}", cmd.cmd)
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -1245,37 +894,45 @@ mod tests {
         terminal.draw(|frame| render(frame, app)).unwrap();
     }
 
+    const MAIN: &str = include_str!("../../tests/fixtures/main-session.jsonl");
+    const SUB: &str = include_str!("../../tests/fixtures/subagent/agent-a1.jsonl");
+
     fn common_fixture() -> &'static str {
-        r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}
-{"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"cmd":"pwd"}],"aggregated_output":"/tmp"}}
-{"type":"event_msg","payload":{"type":"agent_message","message":"done"}}
-{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"{\"cmd\":\"git status\"}"}}
-{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":"clean"}}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"not exec"}}"#
+        r#"{"type":"user","origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"hello"}}
+{"type":"assistant","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"call-0","name":"Bash","input":{"command":"pwd"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-0","content":"/tmp"}]}}
+{"type":"assistant","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"done"}]}}
+{"type":"assistant","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"git status"}}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"clean"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"unmatched","content":"not exec"}]}}"#
+    }
+
+    fn kinds(entries: &[Entry]) -> Vec<EntryKind> {
+        entries.iter().map(|entry| entry.kind).collect()
     }
 
     #[test]
-    fn loads_all_supported_entries_regardless_of_initial_visibility() {
-        let input = r#"{"type":"session_meta","payload":{"id":"ignored"}}
-{"type":"event_msg","payload":{"type":"user_message","message":"hello","phase":"input"}}
-{"type":"event_msg","payload":{"type":"agent_message","message":"world"}}
-{"type":"event_msg","payload":{"type":"exec_command_end","parsed_cmd":[{"type":"exec","cmd":"ls -la","name":"list"}],"aggregated_output":"done"}}"#;
+    fn loads_user_agent_and_bash_entries() {
+        let entries = load_entries_from_str(MAIN).expect("fixture should parse");
 
-        let entries = load_entries_from_str(input).expect("jsonl should parse");
-
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].kind, EntryKind::User);
-        assert_eq!(entries[0].summary, "USER [input]");
-        assert_eq!(entries[0].detail, "hello");
-        assert_eq!(entries[1].kind, EntryKind::Agent);
-        assert_eq!(entries[2].kind, EntryKind::Exec);
-        assert!(entries[2].detail.contains("$ ls -la"));
-        assert!(entries[2].detail.contains("done"));
+        assert_eq!(
+            kinds(&entries),
+            vec![
+                EntryKind::User,
+                EntryKind::User,
+                EntryKind::Agent,
+                EntryKind::Exec
+            ]
+        );
+        assert_eq!(entries[0].summary, "USER");
+        assert_eq!(entries[1].detail, "fix the parser");
+        assert_eq!(entries[2].summary, "AGENT");
+        assert_eq!(entries[2].detail, "checking status");
+        assert_eq!(entries[3].summary, "EXEC git status");
 
         let entries = load_entries_from_str(common_fixture()).expect("fixture should parse");
-        assert_eq!(entries.len(), 4);
         assert_eq!(
-            entries.iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            kinds(&entries),
             vec![
                 EntryKind::User,
                 EntryKind::Exec,
@@ -1283,7 +940,6 @@ mod tests {
                 EntryKind::Exec
             ]
         );
-        assert!(entries[3].detail.contains("clean"));
         assert!(
             entries
                 .iter()
@@ -1292,68 +948,58 @@ mod tests {
     }
 
     #[test]
+    fn bash_output_is_attached_to_its_call() {
+        let entries = load_entries_from_str(MAIN).unwrap();
+        let detail = &entries[3].detail;
+
+        assert!(detail.contains("type: tool_use | name: Bash | call_id: toolu_1"));
+        assert!(detail.contains("$ git status"));
+        assert!(detail.ends_with("OUTPUT\n------\nclean"));
+    }
+
+    #[test]
+    fn non_bash_tools_and_thinking_are_not_entries() {
+        let entries = load_entries_from_str(MAIN).unwrap();
+
+        for hidden in [
+            "file body",
+            "/tmp/a",
+            "hidden",
+            "No response requested",
+            "blob",
+        ] {
+            assert!(
+                entries.iter().all(|entry| !entry.detail.contains(hidden)),
+                "{hidden} must not be replayed"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_handback_is_an_agent_entry() {
+        let entries = load_entries_from_str(SUB).unwrap();
+
+        assert_eq!(kinds(&entries), vec![EntryKind::User, EntryKind::Agent]);
+        assert_eq!(entries[0].detail, "count the files");
+        assert_eq!(entries[1].detail, "there are 3 files");
+    }
+
+    #[test]
     fn loads_preprocessed_json_array_events() {
-        let input = r#"[{"type":"user_message","message":"array input"}]"#;
+        let array = format!("[{}]", MAIN.lines().collect::<Vec<_>>().join(","));
 
-        let entries = load_entries_from_str(input).expect("json array should parse");
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, EntryKind::User);
-        assert_eq!(entries[0].detail, "array input");
-    }
-
-    #[test]
-    fn loads_response_item_exec_tool_calls_as_exec_entries() {
-        let input = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ignored by replay parser"}]}}
-{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"call-1","name":"exec","input":"const r = await tools.exec_command({\"cmd\":\"pwd && ls\",\"workdir\":\"/repo/demo\"});\ntext(r.output);\n","status":"completed"}}
-{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-1","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"/repo/demo\nfile.txt\n"}]}}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"unmatched","output":"not exec"}}"#;
-
-        let entries = load_entries_from_str(input).expect("jsonl should parse");
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].kind, EntryKind::User);
-        assert_eq!(entries[0].detail, "ignored by replay parser");
-        assert_eq!(entries[1].kind, EntryKind::Exec);
-        assert_eq!(entries[1].summary, "EXEC pwd && ls");
-        assert!(entries[1].detail.contains("$ pwd && ls"));
-        assert!(entries[1].detail.contains("RAW INPUT"));
-        assert!(entries[1].detail.contains("Script completed"));
-        assert!(entries[1].detail.contains("file.txt"));
-        assert!(!entries[1].detail.contains("not exec"));
-    }
-
-    #[test]
-    fn loads_function_call_exec_command_as_exec_entry() {
-        let input = r#"{"type":"response_item","payload":{"type":"function_call","call_id":"call-1","name":"exec_command","arguments":"{\"cmd\":\"git status --short\",\"workdir\":\"/repo/demo\"}"}}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":" M README.md"}}"#;
-
-        let entries = load_entries_from_str(input).expect("jsonl should parse");
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, EntryKind::Exec);
-        assert_eq!(entries[0].summary, "EXEC git status --short");
-        assert!(
-            entries[0]
-                .detail
-                .contains("type: function_call | name: exec_command")
-        );
-        assert!(entries[0].detail.contains("$ git status --short"));
-        assert!(entries[0].detail.contains(" M README.md"));
-    }
-
-    #[test]
-    fn extracts_exec_command_from_tool_input() {
-        let input =
-            r#"const r = await tools.exec_command({"cmd":"printf \"hi\"","workdir":"/tmp"});"#;
+        let from_array = load_entries_from_str(&array).expect("json array should parse");
+        let from_lines = load_entries_from_str(MAIN).unwrap();
 
         assert_eq!(
-            extract_exec_command(input).as_deref(),
-            Some(r#"printf "hi""#)
-        );
-        assert_eq!(
-            extract_exec_command(r#"{"cmd":"cargo test"}"#).as_deref(),
-            Some("cargo test")
+            from_array
+                .iter()
+                .map(|entry| (entry.kind, entry.detail.as_str()))
+                .collect::<Vec<_>>(),
+            from_lines
+                .iter()
+                .map(|entry| (entry.kind, entry.detail.as_str()))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1602,12 +1248,11 @@ mod tests {
 
     #[test]
     fn reader_input_preserves_jsonl() {
-        let mut input =
-            br#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#.as_slice();
+        let mut input = br#"{"type":"user","message":{"role":"user","content":"hi"}}"#.as_slice();
 
         assert_eq!(
             read_input_from_reader(&mut input).unwrap(),
-            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#
         );
     }
 }

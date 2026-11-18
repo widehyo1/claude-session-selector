@@ -1,0 +1,3 @@
+{"type":"user","isSidechain":true,"agentId":"a1","parentUuid":null,"message":{"role":"user","content":"count the files"},"timestamp":"2026-11-01T00:00:10.000Z","cwd":"/tmp/fixture","gitBranch":"main"}
+{"type":"user","isSidechain":true,"agentId":"a1","isMeta":true,"parentUuid":"u1","message":{"role":"user","content":"<system-reminder>ignore</system-reminder>"},"timestamp":"2026-11-01T00:00:11.000Z"}
+{"type":"assistant","isSidechain":true,"agentId":"a1","message":{"role":"assistant","model":"claude-test","content":[{"type":"tool_use","id":"toolu_h","name":"SubagentHandback","input":{"message":"there are 3 files"}}]},"timestamp":"2026-11-01T00:00:12.000Z"}

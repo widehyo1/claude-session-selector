@@ -29,70 +29,57 @@ impl SessionFixture {
         self.root.join("sessions")
     }
 
+    pub(crate) fn project_dir(&self) -> PathBuf {
+        let project = self.sessions_root().join("-repo-demo");
+        std::fs::create_dir_all(&project).unwrap();
+        project
+    }
+
     pub(crate) fn write_session_with_exec(&self) -> PathBuf {
-        let day = self.sessions_root().join("2026").join("07").join("26");
-        std::fs::create_dir_all(&day).unwrap();
-        let path = day.join("session.jsonl");
+        let path = self.project_dir().join("session.jsonl");
         write_jsonl_with_exec(&path);
         path
     }
 
+    // A subsession named `sub.jsonl` is written as
+    // `<project>/parent-session/subagents/agent-sub.jsonl`.
     pub(crate) fn write_named_session(
         &self,
         name: &str,
         message: &str,
         subsession: bool,
     ) -> PathBuf {
-        let day = self.sessions_root().join("2026").join("07").join("26");
-        std::fs::create_dir_all(&day).unwrap();
-        let path = day.join(name);
-        let source = if subsession {
-            json!({"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}})
+        let (path, record) = if subsession {
+            let dir = self.project_dir().join("parent-session").join("subagents");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("agent-{name}"));
+            let record = json!({
+                "type": "user",
+                "isSidechain": true,
+                "parentUuid": null,
+                "message": {"role": "user", "content": message},
+                "timestamp": "2026-07-26T01:00:00Z",
+                "cwd": "/repo/demo path",
+                "gitBranch": "main"
+            });
+            (path, record)
         } else {
-            json!("cli")
+            let path = self.project_dir().join(name);
+            (
+                path,
+                human_prompt(message, "2026-07-26T01:00:00Z", "/repo/demo path"),
+            )
         };
-        let records = [
-            json!({
-                "type": "session_meta",
-                "payload": {
-                    "id": format!("session-{name}"),
-                    "timestamp": "2026-07-26T01:00:00Z",
-                    "cwd": "/repo/demo path",
-                    "source": source,
-                    "thread_source": if subsession { "subagent" } else { "user" },
-                    "git": {
-                        "repository_url": "https://git.example/demo.git",
-                        "branch": "main"
-                    }
-                }
-            }),
-            json!({
-                "type": "event_msg",
-                "payload": {"type": "user_message", "message": message}
-            }),
-        ];
-        let contents = records
-            .into_iter()
-            .map(|record| record.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, format!("{contents}\n")).unwrap();
+        std::fs::write(&path, format!("{record}\n")).unwrap();
         path
     }
 
+    // A transcript without user or assistant records is skipped by the indexer.
     pub(crate) fn write_no_meta(&self, name: &str) -> PathBuf {
-        let day = self.sessions_root().join("2026").join("07").join("26");
-        std::fs::create_dir_all(&day).unwrap();
-        let path = day.join(name);
+        let path = self.project_dir().join(name);
         std::fs::write(
             &path,
-            format!(
-                "{}\n",
-                json!({
-                    "type": "event_msg",
-                    "payload": {"type": "user_message", "message": "orphan"}
-                })
-            ),
+            format!("{}\n", json!({"type": "ai-title", "aiTitle": "orphan"})),
         )
         .unwrap();
         path
@@ -105,84 +92,59 @@ impl Drop for SessionFixture {
     }
 }
 
+pub(crate) fn human_prompt(message: &str, timestamp: &str, cwd: &str) -> serde_json::Value {
+    json!({
+        "type": "user",
+        "isSidechain": false,
+        "origin": {"kind": "human"},
+        "promptSource": "typed",
+        "message": {"role": "user", "content": message},
+        "timestamp": timestamp,
+        "cwd": cwd,
+        "gitBranch": "main"
+    })
+}
+
+pub(crate) fn bash_call(call_id: &str, command: &str) -> serde_json::Value {
+    json!({
+        "type": "assistant",
+        "isSidechain": false,
+        "message": {"role": "assistant", "model": "claude-test", "content": [
+            {"type": "tool_use", "id": call_id, "name": "Bash", "input": {"command": command}}
+        ]}
+    })
+}
+
+pub(crate) fn tool_result(call_id: &str, content: serde_json::Value) -> serde_json::Value {
+    json!({
+        "type": "user",
+        "isSidechain": false,
+        "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call_id, "content": content}
+        ]}
+    })
+}
+
 pub(crate) fn write_jsonl_with_exec(path: &Path) {
+    let mut origin_result = tool_result("call-0", json!("# Title"));
+    origin_result["serverClassifierContext"] = json!({"context": {"git_state": {"visibility": {
+        "origin": {"host": "git.example", "remote": "demo", "visibility": "unknown"}
+    }}}});
     let records = [
-        json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "session-id",
-                "timestamp": "2026-05-28T00:00:00Z",
-                "cwd": "/repo/demo",
-                "source": "cli",
-                "thread_source": "user",
-                "git": {
-                    "repository_url": "https://git.example/demo.git",
-                    "branch": "main"
-                }
-            }
-        }),
-        json!({
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "real user request"}
-        }),
-        json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "exec_command_end",
-                "parsed_cmd": [{
-                    "type": "read",
-                    "cmd": "sed -n '1,80p' README.md",
-                    "name": "README.md"
-                }],
-                "aggregated_output": "# Title"
-            }
-        }),
-        json!({
-            "type": "response_item",
-            "payload": {
-                "type": "custom_tool_call",
-                "call_id": "call-1",
-                "name": "exec",
-                "input": "const r = await tools.exec_command({\"cmd\":\"pwd\"});",
-                "status": "completed"
-            }
-        }),
-        json!({
-            "type": "response_item",
-            "payload": {
-                "type": "custom_tool_call_output",
-                "call_id": "call-1",
-                "output": [
-                    {"type": "input_text", "text": "Script completed"},
-                    {"type": "input_text", "text": "/repo/demo"}
-                ]
-            }
-        }),
-        json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call",
-                "call_id": "call-2",
-                "name": "exec_command",
-                "arguments": "{\"cmd\":\"git status --short\",\"workdir\":\"/repo/demo\"}"
-            }
-        }),
-        json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "call-2",
-                "output": " M README.md"
-            }
-        }),
-        json!({
-            "type": "response_item",
-            "payload": {
-                "type": "function_call_output",
-                "call_id": "non-exec-call",
-                "output": "not an exec result"
-            }
-        }),
+        human_prompt("real user request", "2026-05-28T00:00:00Z", "/repo/demo"),
+        bash_call("call-0", "sed -n '1,80p' README.md"),
+        origin_result,
+        bash_call("call-1", "pwd"),
+        tool_result(
+            "call-1",
+            json!([
+                {"type": "text", "text": "Script completed"},
+                {"type": "text", "text": "/repo/demo"}
+            ]),
+        ),
+        bash_call("call-2", "git status --short"),
+        tool_result("call-2", json!(" M README.md")),
+        tool_result("non-exec-call", json!("not an exec result")),
     ];
     let contents = records
         .into_iter()

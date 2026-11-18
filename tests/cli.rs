@@ -31,13 +31,13 @@ impl Fixture {
     }
 
     fn write_session(&self, name: &str, message: &str) -> PathBuf {
-        let day = self.sessions.join("2026/07/27");
-        fs::create_dir_all(&day).unwrap();
-        let path = day.join(name);
+        let project = self.sessions.join("-tmp-demo");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join(name);
         fs::write(
             &path,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{name}\",\"timestamp\":\"2026-07-27T00:00:00Z\",\"cwd\":\"/tmp/demo\",\"source\":\"cli\",\"thread_source\":\"user\"}}}}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{message}\"}}}}\n"
+                "{{\"type\":\"user\",\"isSidechain\":false,\"origin\":{{\"kind\":\"human\"}},\"promptSource\":\"typed\",\"message\":{{\"role\":\"user\",\"content\":\"{message}\"}},\"timestamp\":\"2026-07-27T00:00:00Z\",\"cwd\":\"/tmp/demo\"}}\n"
             ),
         )
         .unwrap();

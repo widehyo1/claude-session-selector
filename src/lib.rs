@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
+use session_event::RecordKind;
+
 mod application;
 mod cli;
 mod indexer;
@@ -92,27 +94,63 @@ pub(crate) struct MessageEvent {
     pub content: String,
 }
 
-pub fn is_subsession_meta(payload: &Value) -> bool {
-    let thread_source = payload
-        .get("thread_source")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    Main {
+        session_id: String,
+    },
+    Subagent {
+        parent_session_id: String,
+        agent_id: String,
+    },
+}
 
-    let source_is_subagent = payload
-        .get("source")
-        .and_then(Value::as_object)
-        .is_some_and(|source| source.contains_key("subagent"));
+// Classifies by path shape only; the file is not opened.
+pub(crate) fn classify_source(path: &Path) -> Option<SourceKind> {
+    if path.extension()?.to_str()? != "jsonl" {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let parent = path.parent()?;
+    if parent.file_name().and_then(|name| name.to_str()) == Some("subagents") {
+        // <root>/<project>/<parent_session_id>/subagents/agent-<id>.jsonl
+        let agent_id = stem.strip_prefix("agent-")?;
+        let parent_session_id = parent.parent()?.file_name()?.to_str()?;
+        return Some(SourceKind::Subagent {
+            parent_session_id: parent_session_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+        });
+    }
+    Some(SourceKind::Main {
+        session_id: stem.to_owned(),
+    })
+}
 
-    let has_agent_role = payload
-        .get("agent_role")
-        .and_then(Value::as_str)
-        .is_some_and(|role| !role.trim().is_empty());
-
-    thread_source == "subagent" || source_is_subagent || has_agent_role
+pub fn is_subsession_path(path: &Path) -> bool {
+    matches!(classify_source(path), Some(SourceKind::Subagent { .. }))
 }
 
 pub fn parse_session_file(path: &Path) -> Result<Option<SessionRow>> {
     Ok(parse_session_file_data(path, false)?.map(|data| data.row))
+}
+
+#[derive(Debug, Default)]
+struct SessionMeta {
+    timestamp: Option<String>,
+    cwd: Option<String>,
+    branch: Option<String>,
+    repository_url: Option<String>,
+}
+
+impl SessionMeta {
+    fn observe(&mut self, value: &Value) {
+        set_first(&mut self.timestamp, value, "timestamp");
+        set_first(&mut self.cwd, value, "cwd");
+        set_first(&mut self.branch, value, "gitBranch");
+        if self.repository_url.is_none() {
+            self.repository_url = session_event::repository_ref(value);
+        }
+    }
 }
 
 pub(crate) fn parse_session_file_data(
@@ -122,11 +160,13 @@ pub(crate) fn parse_session_file_data(
     let file =
         fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut meta: Option<SessionRow> = None;
+    let mut seen_conversation = false;
+    let mut meta = SessionMeta::default();
     let mut best_first_user_message = None;
     let mut exec_events: Vec<ExecEvent> = Vec::new();
     let mut message_events = Vec::new();
     let mut exec_by_call_id: HashMap<String, usize> = HashMap::new();
+    let mut dropped_bash_calls = 0_usize;
 
     for (line_number, line) in reader.lines().enumerate() {
         let line =
@@ -136,34 +176,27 @@ pub(crate) fn parse_session_file_data(
             continue;
         }
 
+        let kind = match session_event::record_kind(line) {
+            Ok(RecordKind::Other) => continue,
+            Ok(kind) => kind,
+            Err(err) => {
+                warn_invalid_json(path, line_number, &err);
+                continue;
+            }
+        };
+        if !matches!(kind, RecordKind::User | RecordKind::Assistant) {
+            continue;
+        }
         let value: Value = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!(
-                    "warning: {}:{}: invalid json: {err}",
-                    path.display(),
-                    line_number + 1
-                );
+                warn_invalid_json(path, line_number, &err);
                 continue;
             }
         };
 
-        let record_type = value.get("type").and_then(Value::as_str);
-        let payload = value.get("payload").unwrap_or(&Value::Null);
-
-        if meta.is_none() && record_type == Some("session_meta") {
-            let git = payload.get("git").unwrap_or(&Value::Null);
-            meta = Some(SessionRow {
-                path: path.to_path_buf(),
-                id: string_field(payload, "id"),
-                timestamp: string_field(payload, "timestamp"),
-                cwd: string_field(payload, "cwd"),
-                repository_url: string_field(git, "repository_url"),
-                branch: string_field(git, "branch"),
-                first_message: String::new(),
-                is_subsession: is_subsession_meta(payload),
-            });
-        }
+        seen_conversation = true;
+        meta.observe(&value);
 
         if let Some(candidate) = session_event::first_user_message_candidate(&value)
             && !candidate.content.trim().is_empty()
@@ -173,11 +206,10 @@ pub(crate) fn parse_session_file_data(
         }
 
         if include_exec {
-            collect_exec_event(
+            dropped_bash_calls += collect_exec_events(
                 path,
                 line_number,
-                record_type,
-                payload,
+                &value,
                 &mut exec_events,
                 &mut exec_by_call_id,
             );
@@ -191,12 +223,39 @@ pub(crate) fn parse_session_file_data(
         }
     }
 
-    let Some(mut row) = meta else {
+    if dropped_bash_calls > 0 {
+        eprintln!(
+            "warning: {}: indexed only the first Bash call of each record; skipped {dropped_bash_calls}",
+            path.display()
+        );
+    }
+    if !seen_conversation {
         return Ok(None);
+    }
+
+    let (id, is_subsession) = match classify_source(path) {
+        Some(SourceKind::Subagent { agent_id, .. }) => (agent_id, true),
+        Some(SourceKind::Main { session_id }) => (session_id, false),
+        None => (
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            false,
+        ),
     };
-    row.first_message = best_first_user_message
-        .map(|(_, candidate)| candidate.content)
-        .unwrap_or_default();
+    let row = SessionRow {
+        path: path.to_path_buf(),
+        id: Some(id),
+        timestamp: meta.timestamp,
+        cwd: meta.cwd,
+        repository_url: meta.repository_url,
+        branch: meta.branch,
+        first_message: best_first_user_message
+            .map(|(_, candidate)| candidate.content)
+            .unwrap_or_default(),
+        is_subsession,
+    };
     for event in &mut exec_events {
         event.session_id = row.id.clone();
     }
@@ -205,6 +264,60 @@ pub(crate) fn parse_session_file_data(
         exec_events,
         message_events,
     }))
+}
+
+fn warn_invalid_json(path: &Path, line_number: usize, err: &serde_json::Error) {
+    eprintln!(
+        "warning: {}:{}: invalid json: {err}",
+        path.display(),
+        line_number + 1
+    );
+}
+
+// Fills the target once, from the first non-blank string value.
+fn set_first(target: &mut Option<String>, value: &Value, field: &str) {
+    if target.is_none() {
+        *target = nonblank_string_field(value, field);
+    }
+}
+
+fn nonblank_string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+// Returns how many Bash calls in this record were not indexed.
+fn collect_exec_events(
+    path: &Path,
+    line_number: usize,
+    value: &Value,
+    exec_events: &mut Vec<ExecEvent>,
+    exec_by_call_id: &mut HashMap<String, usize>,
+) -> usize {
+    // exec_events is unique per (session, line), so only the first call of a record is kept.
+    let mut calls = session_event::bash_calls(value).into_iter();
+    if let Some(call) = calls.next() {
+        exec_by_call_id.insert(call.call_id.clone(), exec_events.len());
+        exec_events.push(ExecEvent {
+            session_path: path.to_path_buf(),
+            session_id: None,
+            event_index: line_number,
+            call_id: Some(call.call_id),
+            kind: "tool_use".to_string(),
+            name: Some("Bash".to_string()),
+            command: call.command,
+            output: String::new(),
+        });
+    }
+    for output in session_event::tool_outputs(value) {
+        if let Some(&index) = exec_by_call_id.get(&output.call_id) {
+            exec_events[index].output = output.output;
+        }
+    }
+    calls.count()
 }
 
 fn prefer_first_user_message(
@@ -277,8 +390,7 @@ pub fn collect_session_data(
     sessions_root: &Path,
     options: CollectOptions,
 ) -> Result<CollectedSessionData> {
-    let mut paths = session_jsonl_paths(sessions_root)?;
-    paths.sort();
+    let paths = session_jsonl_paths(sessions_root)?;
 
     let mut rows = Vec::new();
     let mut exec_events = Vec::new();
@@ -305,6 +417,8 @@ pub fn collect_session_data(
     })
 }
 
+// Main sessions are <root>/<project>/*.jsonl; subagents are
+// <root>/<project>/<session>/subagents/agent-*.jsonl. Nothing else is visited.
 pub fn session_jsonl_paths(sessions_root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
 
@@ -312,21 +426,32 @@ pub fn session_jsonl_paths(sessions_root: &Path) -> Result<Vec<PathBuf>> {
         return Ok(out);
     }
 
-    for year in read_dirs(sessions_root)? {
-        for month in read_dirs(&year)? {
-            for day in read_dirs(&month)? {
-                for entry in fs::read_dir(&day)
-                    .with_context(|| format!("failed to read {}", day.display()))?
-                {
-                    let path = entry?.path();
-                    if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-                        out.push(path);
-                    }
+    for project in read_dirs(sessions_root)? {
+        for entry in fs::read_dir(&project)
+            .with_context(|| format!("failed to read {}", project.display()))?
+        {
+            let path = entry?.path();
+            // Pushed by name only, so an unreadable entry fails the scan instead of vanishing.
+            if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                out.push(path);
+                continue;
+            }
+            let subagents = path.join("subagents");
+            if !subagents.is_dir() {
+                continue;
+            }
+            for sub in fs::read_dir(&subagents)
+                .with_context(|| format!("failed to read {}", subagents.display()))?
+            {
+                let sub = sub?.path();
+                if is_subsession_path(&sub) {
+                    out.push(sub);
                 }
             }
         }
     }
 
+    out.sort();
     Ok(out)
 }
 
@@ -456,157 +581,6 @@ pub fn load_sessions(db_path: &Path) -> Result<Vec<SessionRow>> {
     indexer::store::load_sessions_with_view(db_path, indexer::store::SessionView::default())
 }
 
-fn string_field(value: &Value, field: &str) -> Option<String> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn collect_exec_event(
-    path: &Path,
-    line_number: usize,
-    record_type: Option<&str>,
-    payload: &Value,
-    exec_events: &mut Vec<ExecEvent>,
-    exec_by_call_id: &mut HashMap<String, usize>,
-) {
-    if record_type == Some("event_msg")
-        && payload.get("type").and_then(Value::as_str) == Some("exec_command_end")
-    {
-        exec_events.push(legacy_exec_event(path, line_number, payload));
-        return;
-    }
-
-    if record_type != Some("response_item") {
-        return;
-    }
-
-    match payload.get("type").and_then(Value::as_str) {
-        Some("custom_tool_call") | Some("function_call") if is_exec_tool_call(payload) => {
-            let call_id = string_field(payload, "call_id");
-            let event = ExecEvent {
-                session_path: path.to_path_buf(),
-                session_id: None,
-                event_index: line_number,
-                call_id: call_id.clone(),
-                kind: payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool_call")
-                    .to_string(),
-                name: string_field(payload, "name"),
-                command: exec_tool_command(payload),
-                output: String::new(),
-            };
-            let index = exec_events.len();
-            exec_events.push(event);
-            if let Some(call_id) = call_id {
-                exec_by_call_id.insert(call_id, index);
-            }
-        }
-        Some("custom_tool_call_output") | Some("function_call_output") => {
-            let call_id = string_field(payload, "call_id");
-            let output = payload_text(payload, "output");
-            if let Some(index) = call_id
-                .as_deref()
-                .and_then(|call_id| exec_by_call_id.get(call_id))
-                .copied()
-            {
-                exec_events[index].output = output;
-            }
-        }
-        _ => {}
-    }
-}
-
-fn is_exec_tool_call(payload: &Value) -> bool {
-    matches!(
-        payload.get("name").and_then(Value::as_str),
-        Some("exec") | Some("exec_command")
-    )
-}
-
-fn exec_tool_command(payload: &Value) -> String {
-    let input = payload_text(payload, "input");
-    let input = if input.trim().is_empty() {
-        payload_text(payload, "arguments")
-    } else {
-        input
-    };
-
-    serde_json::from_str::<Value>(&input)
-        .ok()
-        .and_then(|arguments| {
-            arguments
-                .get("cmd")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or(input)
-}
-
-fn legacy_exec_event(path: &Path, line_number: usize, payload: &Value) -> ExecEvent {
-    let parsed_cmd = payload
-        .get("parsed_cmd")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let command = parsed_cmd
-        .iter()
-        .filter_map(|cmd| cmd.get("cmd").and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let name = parsed_cmd.iter().find_map(command_name);
-
-    ExecEvent {
-        session_path: path.to_path_buf(),
-        session_id: None,
-        event_index: line_number,
-        call_id: None,
-        kind: "exec_command_end".to_string(),
-        name,
-        command,
-        output: payload_text(payload, "aggregated_output"),
-    }
-}
-
-fn command_name(cmd: &Value) -> Option<String> {
-    ["name", "path", "type"]
-        .iter()
-        .filter_map(|field| cmd.get(field).and_then(Value::as_str))
-        .find(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn payload_text(payload: &Value, field: &str) -> String {
-    let Some(value) = payload.get(field) else {
-        return String::new();
-    };
-
-    value_to_text(value)
-}
-
-fn value_to_text(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::String(value) => value.clone(),
-        Value::Array(values) => values
-            .iter()
-            .map(value_to_text)
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Object(object) => object
-            .get("text")
-            .and_then(Value::as_str)
-            .or_else(|| object.get("output").and_then(Value::as_str))
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| value.to_string()),
-        _ => value.to_string(),
-    }
-}
-
 fn read_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
@@ -621,14 +595,47 @@ fn read_dirs(path: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use serde_json::json;
+    use std::fs;
 
     use super::*;
+    use crate::test_support::SessionFixture;
+
+    const MAIN: &str = include_str!("../tests/fixtures/main-session.jsonl");
+    const SUB: &str = include_str!("../tests/fixtures/subagent/agent-a1.jsonl");
+    const SUB_META: &str = include_str!("../tests/fixtures/subagent/agent-a1.meta.json");
+
+    struct Layout {
+        fixture: SessionFixture,
+        main: PathBuf,
+        sub: PathBuf,
+    }
+
+    // <root>/-tmp-fixture/main-1.jsonl and main-1/subagents/agent-a1.jsonl
+    fn layout() -> Layout {
+        let fixture = SessionFixture::new();
+        let project = fixture.sessions_root().join("-tmp-fixture");
+        let subagents = project.join("main-1").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let main = project.join("main-1.jsonl");
+        let sub = subagents.join("agent-a1.jsonl");
+        fs::write(&main, MAIN).unwrap();
+        fs::write(&sub, SUB).unwrap();
+        fs::write(subagents.join("agent-a1.meta.json"), SUB_META).unwrap();
+        Layout { fixture, main, sub }
+    }
+
+    fn row(path: &str, first_message: &str) -> SessionRow {
+        SessionRow {
+            path: PathBuf::from(path),
+            id: None,
+            timestamp: None,
+            cwd: None,
+            repository_url: None,
+            branch: None,
+            first_message: first_message.to_string(),
+            is_subsession: false,
+        }
+    }
 
     #[test]
     fn collect_options_default_disables_all_optional_data() {
@@ -639,209 +646,197 @@ mod tests {
         assert!(!options.include_exec);
     }
 
-    fn temp_path(name: &str) -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("claude-session-selector-{nonce}-{name}"))
-    }
-
-    fn write_jsonl(path: &Path, message: &str, source: Value, thread_source: &str) {
-        let meta = json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "session-id",
-                "timestamp": "2026-05-28T00:00:00Z",
-                "cwd": "/repo/demo",
-                "source": source,
-                "thread_source": thread_source,
-                "git": {
-                    "repository_url": "https://git.example/demo.git",
-                    "branch": "main"
-                }
-            }
-        });
-        let user = json!({
-            "type": "event_msg",
-            "payload": {
-                "type": "user_message",
-                "message": message
-            }
-        });
-        fs::write(path, format!("{meta}\n{user}\n")).unwrap();
-    }
-
     #[test]
-    fn detects_subsessions_from_session_meta_structure() {
-        assert!(is_subsession_meta(&json!({
-            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent"}}}
-        })));
-        assert!(is_subsession_meta(&json!({"thread_source": "subagent"})));
-        assert!(is_subsession_meta(&json!({"agent_role": "worker"})));
-        assert!(!is_subsession_meta(
-            &json!({"source": "cli", "thread_source": "user"})
-        ));
-    }
-
-    #[test]
-    fn parse_session_file_extracts_metadata_and_first_message() {
-        let path = temp_path("human.jsonl");
-        write_jsonl(&path, "real user request", json!("cli"), "user");
-
-        let row = parse_session_file(&path).unwrap().unwrap();
-
-        assert_eq!(row.path, path);
-        assert_eq!(row.id.as_deref(), Some("session-id"));
-        assert_eq!(row.timestamp.as_deref(), Some("2026-05-28T00:00:00Z"));
-        assert_eq!(row.cwd.as_deref(), Some("/repo/demo"));
+    fn classify_source_distinguishes_main_and_subagent() {
+        let layout = layout();
         assert_eq!(
-            row.repository_url.as_deref(),
-            Some("https://git.example/demo.git")
+            classify_source(&layout.main),
+            Some(SourceKind::Main {
+                session_id: "main-1".to_string()
+            })
         );
+        assert_eq!(
+            classify_source(&layout.sub),
+            Some(SourceKind::Subagent {
+                parent_session_id: "main-1".to_string(),
+                agent_id: "a1".to_string(),
+            })
+        );
+        assert_eq!(
+            classify_source(&layout.sub.with_file_name("agent-a1.meta.json")),
+            None
+        );
+        assert_eq!(
+            classify_source(&layout.sub.with_file_name("notes.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn session_jsonl_paths_lists_main_and_subagent_files_only() {
+        let layout = layout();
+        let root = layout.fixture.sessions_root();
+        let project = root.join("-tmp-fixture");
+        let tool_results = project.join("main-1").join("tool-results");
+        fs::create_dir_all(&tool_results).unwrap();
+        fs::write(tool_results.join("x.jsonl"), "{}\n").unwrap();
+        fs::create_dir_all(project.join("memory")).unwrap();
+        fs::write(project.join("memory").join("MEMORY.md"), "").unwrap();
+        fs::write(root.join("stray.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(
+            session_jsonl_paths(&root).unwrap(),
+            vec![layout.sub.clone(), layout.main.clone()]
+        );
+        assert!(
+            session_jsonl_paths(&root.join("missing"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn main_session_row_uses_first_values() {
+        let layout = layout();
+        let row = parse_session_file(&layout.main).unwrap().unwrap();
+
+        assert_eq!(row.path, layout.main);
+        assert_eq!(row.id.as_deref(), Some("main-1"));
+        assert_eq!(row.timestamp.as_deref(), Some("2026-11-01T00:00:00.000Z"));
+        assert_eq!(row.cwd.as_deref(), Some("/tmp/fixture"));
         assert_eq!(row.branch.as_deref(), Some("main"));
-        assert_eq!(row.first_message, "real user request");
+        assert_eq!(row.repository_url.as_deref(), Some("git.example/team/repo"));
+        assert_eq!(row.first_message, "fix the parser");
         assert!(!row.is_subsession);
-
-        let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn parse_session_file_extracts_first_message_from_response_item_user_message() {
-        let path = temp_path("response-item-user.jsonl");
-        let meta = json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "response-item-session",
-                "timestamp": "2026-08-07T08:00:00Z",
-                "cwd": "/repo/demo",
-                "source": "cli",
-                "thread_source": "user"
-            }
-        });
-        let user = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "content": [{"type": "input_text", "text": "latest user request"}]
-            }
-        });
-        fs::write(&path, format!("{meta}\n{user}\n")).unwrap();
+    fn subagent_row_reads_path() {
+        let layout = layout();
+        let row = parse_session_file(&layout.sub).unwrap().unwrap();
 
-        let row = parse_session_file(&path).unwrap().unwrap();
-
-        assert_eq!(row.first_message, "latest user request");
-        assert!(should_include_row(&row, CollectOptions::default()));
-        let _ = fs::remove_file(path);
+        assert_eq!(row.id.as_deref(), Some("a1"));
+        assert!(row.is_subsession);
+        assert_eq!(row.first_message, "count the files");
+        assert_eq!(row.cwd.as_deref(), Some("/tmp/fixture"));
     }
 
     #[test]
-    fn parse_session_file_skips_environment_context_before_the_user_request() {
-        let path = temp_path("response-item-environment-context.jsonl");
-        let meta = json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "environment-context-session",
-                "timestamp": "2026-08-07T08:00:00Z",
-                "cwd": "/repo/demo",
-                "source": "cli",
-                "thread_source": "user"
-            }
-        });
-        let environment = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "internal_chat_message_metadata_passthrough": {
-                    "content_item_kinds": ["environments.environment_context"]
-                },
-                "content": [{
-                    "type": "input_text",
-                    "text": "<environment_context>\\n  <cwd>/repo/demo</cwd>\\n</environment_context>"
-                }]
-            }
-        });
-        let user = json!({
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "user",
-                "internal_chat_message_metadata_passthrough": {
-                    "content_item_kinds": ["user.text"]
-                },
-                "content": [{"type": "input_text", "text": "actual user request"}]
-            }
-        });
-        fs::write(&path, format!("{meta}\n{environment}\n{user}\n")).unwrap();
+    fn unsourced_prompt_is_used_when_no_typed_prompt_exists() {
+        let layout = layout();
+        let only_command: String = MAIN
+            .lines()
+            .filter(|line| !line.contains("fix the parser"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        fs::write(&layout.main, only_command).unwrap();
 
-        let row = parse_session_file(&path).unwrap().unwrap();
-
-        assert_eq!(row.first_message, "actual user request");
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn parse_session_file_prefers_confirmed_message_over_fallback() {
-        let path = temp_path("first-user-priority.jsonl");
-        let meta = json!({"type": "session_meta", "payload": {
-            "id": "priority-session", "timestamp": "2026-09-13T00:00:00Z", "cwd": "/repo"
-        }});
-        let fallback = json!({"type": "response_item", "payload": {
-            "type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "unmarked request"}]
-        }});
-        let confirmed = json!({"type": "event_msg", "payload": {
-            "type": "item_completed", "item": {"type": "UserMessage", "content": [
-                {"type": "text", "text": "confirmed request"}
-            ]}
-        }});
-        fs::write(&path, format!("{meta}\n{fallback}\n{confirmed}\n")).unwrap();
         assert_eq!(
-            parse_session_file(&path).unwrap().unwrap().first_message,
-            "confirmed request"
+            parse_session_file(&layout.main)
+                .unwrap()
+                .unwrap()
+                .first_message,
+            "<command-message>init</command-message>"
         );
-        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exec_events_pair_bash_calls_with_results() {
+        let layout = layout();
+        let parsed = parse_session_file_data(&layout.main, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            parsed.exec_events,
+            vec![ExecEvent {
+                session_path: layout.main.clone(),
+                session_id: Some("main-1".to_string()),
+                event_index: 7,
+                call_id: Some("toolu_1".to_string()),
+                kind: "tool_use".to_string(),
+                name: Some("Bash".to_string()),
+                command: "git status".to_string(),
+                output: "clean".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn message_events_exclude_meta_blob_and_tool_results() {
+        let layout = layout();
+        let parsed = parse_session_file_data(&layout.main, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            parsed
+                .message_events
+                .iter()
+                .map(|event| (event.event_index, event.role))
+                .collect::<Vec<_>>(),
+            vec![
+                (3, session_event::MessageRole::User),
+                (4, session_event::MessageRole::User),
+                (6, session_event::MessageRole::Agent),
+            ]
+        );
+
+        let sub = parse_session_file_data(&layout.sub, true).unwrap().unwrap();
+        assert_eq!(
+            sub.message_events
+                .iter()
+                .map(|event| (event.role, event.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (session_event::MessageRole::User, "count the files"),
+                (session_event::MessageRole::Agent, "there are 3 files"),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_first_bash_call_of_a_record_is_indexed() {
+        let layout = layout();
+        let record = serde_json::json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "one"}},
+            {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "two"}}
+        ]}});
+        fs::write(&layout.main, format!("{record}\n")).unwrap();
+
+        let parsed = parse_session_file_data(&layout.main, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.exec_events.len(), 1);
+        assert_eq!(parsed.exec_events[0].command, "one");
+    }
+
+    #[test]
+    fn file_without_conversation_is_skipped() {
+        let layout = layout();
+        fs::write(
+            &layout.main,
+            "{\"type\":\"mode\",\"mode\":\"normal\"}\n{\"type\":\"ai-title\",\"aiTitle\":\"t\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(parse_session_file(&layout.main).unwrap(), None);
     }
 
     #[test]
     fn invalid_json_line_is_skipped_before_valid_session_records() {
-        let path = temp_path("invalid-then-valid.jsonl");
-        let meta = json!({
-            "type": "session_meta",
-            "payload": {
-                "id": "valid-after-warning",
-                "timestamp": "2026-07-27T00:00:00Z",
-                "cwd": "/repo/demo",
-                "source": "cli",
-                "thread_source": "user"
-            }
-        });
-        let user = json!({
-            "type": "event_msg",
-            "payload": {"type": "user_message", "message": "valid message"}
-        });
-        fs::write(&path, format!("not-json\n{meta}\n{user}\n")).unwrap();
+        let layout = layout();
+        fs::write(&layout.main, format!("not-json\n{{\"type\":\n{MAIN}")).unwrap();
 
-        let row = parse_session_file(&path).unwrap().unwrap();
-        assert_eq!(row.id.as_deref(), Some("valid-after-warning"));
-        assert_eq!(row.first_message, "valid message");
-        let _ = fs::remove_file(path);
+        let row = parse_session_file(&layout.main).unwrap().unwrap();
+        assert_eq!(row.id.as_deref(), Some("main-1"));
+        assert_eq!(row.first_message, "fix the parser");
     }
 
     #[test]
     fn should_include_hides_empty_and_subsession_by_default() {
-        let mut row = SessionRow {
-            path: PathBuf::from("/tmp/a.jsonl"),
-            id: None,
-            timestamp: None,
-            cwd: None,
-            repository_url: None,
-            branch: None,
-            first_message: "ordinary looking task text".to_string(),
-            is_subsession: true,
-        };
+        let mut row = row("/tmp/a.jsonl", "ordinary looking task text");
+        row.is_subsession = true;
         assert!(!should_include_row(&row, CollectOptions::default()));
 
         row.is_subsession = false;
@@ -854,35 +849,24 @@ mod tests {
 
     #[test]
     fn filter_sessions_searches_message_metadata_and_date() {
-        let rows = vec![
-            SessionRow {
-                path: PathBuf::from("/tmp/a.jsonl"),
-                id: None,
-                timestamp: Some("2026-05-27T01:00:00Z".to_string()),
-                cwd: Some("/repo/alpha".to_string()),
-                repository_url: Some("https://git.example/alpha.git".to_string()),
-                branch: Some("main".to_string()),
-                first_message: "fix docker compose".to_string(),
-                is_subsession: false,
-            },
-            SessionRow {
-                path: PathBuf::from("/tmp/b.jsonl"),
-                id: None,
-                timestamp: Some("2026-05-28T01:00:00Z".to_string()),
-                cwd: Some("/repo/beta".to_string()),
-                repository_url: Some("https://git.example/beta.git".to_string()),
-                branch: Some("feature/search".to_string()),
-                first_message: "add selector".to_string(),
-                is_subsession: false,
-            },
-        ];
+        let mut a = row("/tmp/a.jsonl", "fix docker compose");
+        a.timestamp = Some("2026-05-27T01:00:00Z".to_string());
+        a.cwd = Some("/repo/alpha".to_string());
+        a.repository_url = Some("git.example/alpha".to_string());
+        a.branch = Some("main".to_string());
+        let mut b = row("/tmp/b.jsonl", "add selector");
+        b.timestamp = Some("2026-05-28T01:00:00Z".to_string());
+        b.cwd = Some("/repo/beta".to_string());
+        b.repository_url = Some("git.example/beta".to_string());
+        b.branch = Some("feature/search".to_string());
+        let rows = vec![a, b];
 
         assert_eq!(
             filter_sessions(&rows, "docker")[0].path,
             PathBuf::from("/tmp/a.jsonl")
         );
         assert_eq!(
-            filter_sessions(&rows, "alpha.git")[0].path,
+            filter_sessions(&rows, "example/alpha")[0].path,
             PathBuf::from("/tmp/a.jsonl")
         );
         assert_eq!(
@@ -897,11 +881,9 @@ mod tests {
 
     #[test]
     fn collect_session_data_omits_exec_by_default_and_collects_when_enabled() {
-        let root = temp_path("sessions");
-        let day = root.join("2026").join("05").join("28");
-        fs::create_dir_all(&day).unwrap();
-        let path = day.join("rollout.jsonl");
-        crate::test_support::write_jsonl_with_exec(&path);
+        let fixture = SessionFixture::new();
+        fixture.write_session_with_exec();
+        let root = fixture.sessions_root();
 
         let default_data = collect_session_data(&root, CollectOptions::default()).unwrap();
         assert_eq!(default_data.rows.len(), 1);
@@ -917,51 +899,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(with_exec.rows.len(), 1);
-        assert_eq!(with_exec.exec_events.len(), 3);
-        assert_eq!(with_exec.exec_events[0].kind, "exec_command_end");
-        assert_eq!(with_exec.exec_events[0].name.as_deref(), Some("README.md"));
-        assert_eq!(with_exec.exec_events[0].command, "sed -n '1,80p' README.md");
-        assert_eq!(with_exec.exec_events[0].output, "# Title");
-        assert_eq!(with_exec.exec_events[1].kind, "custom_tool_call");
-        assert_eq!(with_exec.exec_events[1].call_id.as_deref(), Some("call-1"));
-        assert!(
-            with_exec.exec_events[1]
-                .command
-                .contains("tools.exec_command")
-        );
-        assert!(with_exec.exec_events[1].output.contains("Script completed"));
-        assert!(with_exec.exec_events[1].output.contains("/repo/demo"));
-        assert_eq!(with_exec.exec_events[2].kind, "function_call");
+        let events = with_exec
+            .exec_events
+            .iter()
+            .map(|event| {
+                (
+                    event.call_id.as_deref().unwrap(),
+                    event.command.as_str(),
+                    event.output.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            with_exec.exec_events[2].name.as_deref(),
-            Some("exec_command")
+            events,
+            vec![
+                ("call-0", "sed -n '1,80p' README.md", "# Title"),
+                ("call-1", "pwd", "Script completed\n/repo/demo"),
+                ("call-2", "git status --short", " M README.md"),
+            ]
         );
-        assert_eq!(with_exec.exec_events[2].command, "git status --short");
-        assert_eq!(with_exec.exec_events[2].output, " M README.md");
-
-        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            with_exec.rows[0].repository_url.as_deref(),
+            Some("git.example/demo")
+        );
     }
 
     #[test]
     fn recreate_database_creates_exec_table_only_when_requested() {
-        let db_path = temp_path("sessions.sqlite3");
-        let row = SessionRow {
-            path: PathBuf::from("/tmp/session.jsonl"),
-            id: Some("session-id".to_string()),
-            timestamp: Some("2026-05-28T00:00:00Z".to_string()),
-            cwd: Some("/repo/demo".to_string()),
-            repository_url: Some("https://git.example/demo.git".to_string()),
-            branch: Some("main".to_string()),
-            first_message: "real user request".to_string(),
-            is_subsession: false,
-        };
+        let fixture = SessionFixture::new();
+        let db_path = fixture.path("sessions.sqlite3");
+        let mut row = row("/tmp/session.jsonl", "real user request");
+        row.id = Some("session-id".to_string());
         let exec = ExecEvent {
             session_path: row.path.clone(),
             session_id: row.id.clone(),
             event_index: 2,
             call_id: Some("call-1".to_string()),
-            kind: "custom_tool_call".to_string(),
-            name: Some("exec".to_string()),
+            kind: "tool_use".to_string(),
+            name: Some("Bash".to_string()),
             command: "pwd".to_string(),
             output: "/repo/demo".to_string(),
         };
@@ -977,7 +952,5 @@ mod tests {
             .query_row("SELECT count(*) FROM exec_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
-
-        let _ = fs::remove_file(db_path);
     }
 }

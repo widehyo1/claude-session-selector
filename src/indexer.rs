@@ -1047,48 +1047,24 @@ mod tests {
 
         for file_count in [100_usize, 1_000, 10_000] {
             let fixture = SessionFixture::new();
-            let day = fixture.sessions_root().join("2026/07/27");
+            let day = fixture.sessions_root().join("-tmp-benchmark");
             fs::create_dir_all(&day).unwrap();
             let output = "x".repeat(1024);
             let mut paths = Vec::with_capacity(file_count);
             for index in 0..file_count {
                 let path = day.join(format!("session-{index:05}.jsonl"));
-                let mut records = vec![
-                    json!({
-                        "type": "session_meta",
-                        "payload": {
-                            "id": format!("benchmark-{index}"),
-                            "timestamp": "2026-07-27T00:00:00Z",
-                            "cwd": "/tmp/benchmark path",
-                            "source": "cli",
-                            "thread_source": "user",
-                            "git": {
-                                "repository_url": "https://git.example/benchmark.git",
-                                "branch": "main"
-                            }
-                        }
-                    }),
-                    json!({
-                        "type": "event_msg",
-                        "payload": {
-                            "type": "user_message",
-                            "message": "증분 인덱스 확인"
-                        }
-                    }),
-                ];
+                let mut records = vec![crate::test_support::human_prompt(
+                    "증분 인덱스 확인",
+                    "2026-07-27T00:00:00Z",
+                    "/tmp/benchmark path",
+                )];
                 for event in 0..10 {
-                    records.push(json!({
-                        "type": "event_msg",
-                        "payload": {
-                            "type": "exec_command_end",
-                            "parsed_cmd": [{
-                                "type": "read",
-                                "cmd": format!("printf '\\\"/{index}/{event}\\\"'"),
-                                "name": "benchmark"
-                            }],
-                            "aggregated_output": output
-                        }
-                    }));
+                    let call_id = format!("call-{event}");
+                    records.push(crate::test_support::bash_call(
+                        &call_id,
+                        &format!("printf '\\\"/{index}/{event}\\\"'"),
+                    ));
+                    records.push(crate::test_support::tool_result(&call_id, json!(output)));
                 }
                 let contents = records
                     .into_iter()

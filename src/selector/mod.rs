@@ -56,6 +56,13 @@ impl SearchTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentJump {
+    Moved,
+    NotSubsession,
+    NotInView,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SelectorAction {
     Quit,
@@ -129,7 +136,36 @@ impl SelectorApp {
     }
 
     fn selected_resume_command(&self) -> Option<String> {
-        self.selected_row().and_then(resume_command)
+        self.selected_row()
+            .and_then(|row| resume_command(row, &self.all_rows))
+    }
+
+    // Searches only the current list so the query is kept.
+    fn jump_to_parent(&mut self) -> ParentJump {
+        let Some(parent_id) = self
+            .selected_row()
+            .and_then(|row| row.parent_session_id.clone())
+        else {
+            return ParentJump::NotSubsession;
+        };
+        match self.filtered.iter().position(|candidate| {
+            !candidate.is_subsession && candidate.id.as_deref() == Some(parent_id.as_str())
+        }) {
+            Some(index) => {
+                self.list_state.select(Some(index));
+                self.message_scroll = 0;
+                ParentJump::Moved
+            }
+            None => ParentJump::NotInView,
+        }
+    }
+
+    fn select_parent(&mut self) {
+        self.status = match self.jump_to_parent() {
+            ParentJump::Moved => None,
+            ParentJump::NotSubsession => Some("selected session has no parent".to_string()),
+            ParentJump::NotInView => Some("parent session is not in the current list".to_string()),
+        };
     }
 
     fn refresh_filter(&mut self) {
@@ -204,7 +240,12 @@ impl SelectorApp {
 
     fn copy_resume_command_to_clipboard(&mut self) {
         let Some(command) = self.selected_resume_command() else {
-            self.status = Some("selected session has no id".to_string());
+            self.status = Some(match self.selected_row() {
+                Some(row) if row.is_subsession => {
+                    "parent session is not indexed in this view".to_string()
+                }
+                _ => "selected session has no id".to_string(),
+            });
             return;
         };
 
@@ -327,6 +368,10 @@ impl SelectorApp {
                 }
                 KeyCode::Char('y') => {
                     self.copy_resume_command_to_clipboard();
+                    None
+                }
+                KeyCode::Char('p') => {
+                    self.select_parent();
                     None
                 }
                 KeyCode::Tab => {
@@ -623,6 +668,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Enter replay "),
             Span::raw(" e exec "),
             Span::raw(" y copy-resume "),
+            Span::raw(" p parent "),
             Span::raw(" q quit "),
             Span::raw(" Ctrl-C quit "),
             Span::raw(" ? help "),
@@ -650,7 +696,8 @@ fn render_help(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw("Left pane shows date, cwd, branch, and repository URL."),
+        Line::raw("Left pane shows date, title, cwd, branch, and repository."),
+        Line::raw("[CONT] marks a session that was continued in another session."),
         Line::raw("Right pane shows the selected session's first user message."),
         Line::raw(""),
         Line::raw("Focus"),
@@ -677,7 +724,9 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  Enter           replay the selected jsonl path"),
         Line::raw("                  return from replay to this selector when replay exits"),
         Line::raw("  e               toggle exec entries for the next replay"),
-        Line::raw("  y               copy `codex resume <session-id>` to clipboard"),
+        Line::raw("  y               copy `cd <cwd> && claude --resume <id>` to clipboard"),
+        Line::raw("                  a subsession copies its parent session's command"),
+        Line::raw("  p               select the parent session of a subsession"),
         Line::raw("  ?               toggle help"),
         Line::raw("  q / Ctrl-C      quit"),
     ])
@@ -703,10 +752,18 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
         };
         segments.push((label.to_string(), style));
     }
+    if row.continued_in_session_id.is_some() {
+        segments.push(("[CONT] ".to_string(), Style::default().fg(Color::Magenta)));
+    }
     segments.extend([
         (
             dash_empty(&session_date(row)).to_string(),
             Style::default().fg(Color::Cyan),
+        ),
+        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
+        (
+            dash_empty(row.title.as_deref().unwrap_or_default()).to_string(),
+            Style::default().fg(Color::White),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
         (
@@ -757,11 +814,28 @@ fn scrolled_segments(segments: &[(String, Style)], scroll: usize) -> Line<'stati
     Line::from(spans)
 }
 
-fn resume_command(row: &SessionRow) -> Option<String> {
-    row.id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-        .map(|id| format!("codex resume {id}"))
+// POSIX sh single quoting: each ' becomes '\''.
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+// A subsession has no resumable id of its own, so it resolves to its parent main session.
+fn resume_command(row: &SessionRow, all_rows: &[SessionRow]) -> Option<String> {
+    let target = if row.is_subsession {
+        let parent_id = row.parent_session_id.as_deref()?;
+        all_rows.iter().find(|candidate| {
+            !candidate.is_subsession && candidate.id.as_deref() == Some(parent_id)
+        })?
+    } else {
+        row
+    };
+    let id = target.id.as_deref().filter(|id| !id.trim().is_empty())?;
+    Some(
+        match target.cwd.as_deref().filter(|cwd| !cwd.trim().is_empty()) {
+            Some(cwd) => format!("cd {} && claude --resume {id}", shell_single_quote(cwd)),
+            None => format!("claude --resume {id}"),
+        },
+    )
 }
 
 fn dash_empty(value: &str) -> &str {
@@ -881,8 +955,25 @@ mod tests {
 
         assert_eq!(
             metadata_plain(&rows[1], false),
-            "2026-05-28 | /repo/beta | feature/search | https://git.example/beta.git"
+            "2026-05-28 | - | /repo/beta | feature/search | https://git.example/beta.git"
         );
+
+        let mut titled = rows[0].clone();
+        titled.title = Some("Parser fix".to_string());
+        assert_eq!(
+            metadata_plain(&titled, false),
+            "2026-05-27 | Parser fix | /repo/alpha | main | https://git.example/alpha.git"
+        );
+    }
+
+    #[test]
+    fn continued_badge_is_shown_without_subsession_option() {
+        let mut rows = sample_rows();
+        rows[0].continued_in_session_id = Some("next".to_string());
+
+        assert!(metadata_plain(&rows[0], false).starts_with("[CONT] 2026-05-27 | "));
+        assert!(metadata_plain(&rows[0], true).starts_with("[MAIN] [CONT] 2026-05-27 | "));
+        assert!(!metadata_plain(&rows[1], false).contains("[CONT]"));
     }
 
     #[test]
@@ -892,15 +983,15 @@ mod tests {
 
         assert_eq!(
             metadata_plain(&rows[0], false),
-            "2026-05-27 | /repo/alpha | main | https://git.example/alpha.git"
+            "2026-05-27 | - | /repo/alpha | main | https://git.example/alpha.git"
         );
         assert_eq!(
             metadata_plain(&rows[0], true),
-            "[MAIN] 2026-05-27 | /repo/alpha | main | https://git.example/alpha.git"
+            "[MAIN] 2026-05-27 | - | /repo/alpha | main | https://git.example/alpha.git"
         );
         assert_eq!(
             metadata_plain(&rows[1], true),
-            "[SUB] 2026-05-28 | /repo/beta | feature/search | https://git.example/beta.git"
+            "[SUB] 2026-05-28 | - | /repo/beta | feature/search | https://git.example/beta.git"
         );
     }
 
@@ -965,7 +1056,7 @@ mod tests {
     #[test]
     fn scrolled_segments_preserve_text_after_horizontal_offset() {
         let rows = sample_rows();
-        let line = scrolled_segments(&metadata_segments(&rows[1], false), 13);
+        let line = scrolled_segments(&metadata_segments(&rows[1], false), 17);
         let text = line
             .spans
             .into_iter()
@@ -976,18 +1067,160 @@ mod tests {
         assert!(text.starts_with("/repo/beta"));
     }
 
-    #[test]
-    fn resume_command_uses_session_id() {
-        let mut rows = sample_rows();
-        rows[0].id = Some("019e6ce6-08f8-77e0-ba64-f303967970e0".to_string());
+    fn main_row(id: &str, cwd: Option<&str>) -> SessionRow {
+        SessionRow {
+            path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+            id: Some(id.to_string()),
+            cwd: cwd.map(str::to_string),
+            first_message: "main".to_string(),
+            ..SessionRow::default()
+        }
+    }
 
+    fn sub_row(id: &str, parent: &str) -> SessionRow {
+        SessionRow {
+            path: PathBuf::from(format!("/tmp/{parent}/subagents/agent-{id}.jsonl")),
+            id: Some(id.to_string()),
+            cwd: Some("/elsewhere".to_string()),
+            first_message: "sub".to_string(),
+            is_subsession: true,
+            parent_session_id: Some(parent.to_string()),
+            ..SessionRow::default()
+        }
+    }
+
+    #[test]
+    fn resume_command_changes_directory_first() {
+        let row = main_row("main-1", Some("/tmp/fixture"));
         assert_eq!(
-            resume_command(&rows[0]).as_deref(),
-            Some("codex resume 019e6ce6-08f8-77e0-ba64-f303967970e0")
+            resume_command(&row, &[]).as_deref(),
+            Some("cd '/tmp/fixture' && claude --resume main-1")
+        );
+    }
+
+    #[test]
+    fn resume_command_quotes_single_quotes_in_cwd() {
+        let row = main_row("main-1", Some("/tmp/it's"));
+        assert_eq!(
+            resume_command(&row, &[]).as_deref(),
+            Some(r"cd '/tmp/it'\''s' && claude --resume main-1")
+        );
+    }
+
+    #[test]
+    fn resume_command_without_cwd_omits_cd() {
+        let row = main_row("main-1", None);
+        assert_eq!(
+            resume_command(&row, &[]).as_deref(),
+            Some("claude --resume main-1")
         );
 
-        rows[0].id = None;
-        assert_eq!(resume_command(&rows[0]), None);
+        let mut no_id = row;
+        no_id.id = None;
+        assert_eq!(resume_command(&no_id, &[]), None);
+    }
+
+    #[test]
+    fn subsession_resume_command_targets_the_parent() {
+        let rows = vec![
+            main_row("main-1", Some("/tmp/fixture")),
+            sub_row("a1", "main-1"),
+        ];
+        assert_eq!(
+            resume_command(&rows[1], &rows).as_deref(),
+            Some("cd '/tmp/fixture' && claude --resume main-1")
+        );
+    }
+
+    #[test]
+    fn subsession_resume_command_needs_the_parent_row() {
+        let rows = vec![sub_row("a1", "main-1")];
+        assert_eq!(resume_command(&rows[0], &rows), None);
+    }
+
+    fn parent_app(query: &str) -> (SessionFixture, SelectorApp) {
+        let fixture = SessionFixture::new();
+        fixture.write_named_session("parent-session.jsonl", "main task", false);
+        fixture.write_named_session("sub.jsonl", "sub task", true);
+        let db = fixture.path("index.sqlite3");
+        build_index(&IndexOptions {
+            output: db.clone(),
+            sessions_root: fixture.sessions_root(),
+            rebuild: false,
+            quick_check: false,
+            include_subsessions: false,
+            include_empty_messages: false,
+            include_exec: false,
+        })
+        .unwrap();
+        let index = SearchIndex::open(
+            &db,
+            SessionView {
+                include_subsessions: true,
+                include_empty_messages: false,
+            },
+        )
+        .unwrap();
+        let mut app = SelectorApp::new(index, ExecVisibility::Hidden).unwrap();
+        app.query = query.to_string();
+        app.refresh_filter();
+        let sub = app
+            .filtered
+            .iter()
+            .position(|row| row.is_subsession)
+            .unwrap();
+        app.list_state.select(Some(sub));
+        (fixture, app)
+    }
+
+    #[test]
+    fn p_moves_selection_to_the_parent_row() {
+        let (_fixture, mut app) = parent_app("");
+
+        assert_eq!(app.handle_key(key(KeyCode::Char('p'))), None);
+        let selected = app.selected_row().unwrap();
+        assert!(!selected.is_subsession);
+        assert_eq!(selected.id.as_deref(), Some("parent-session"));
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn p_on_main_row_reports_no_parent() {
+        let (_fixture, mut app) = parent_app("");
+        app.handle_key(key(KeyCode::Char('p')));
+        let selected = app.selected_index();
+
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.jump_to_parent(), ParentJump::NotSubsession);
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("selected session has no parent")
+        );
+    }
+
+    #[test]
+    fn p_reports_parent_outside_the_filtered_list() {
+        let (_fixture, mut app) = parent_app("sub");
+        let selected = app.selected_index();
+
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.selected_index(), selected);
+        assert_eq!(app.query, "sub");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("parent session is not in the current list")
+        );
+    }
+
+    #[test]
+    fn p_is_search_text_while_searching() {
+        let (_fixture, mut app) = parent_app("");
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('p')));
+
+        assert_eq!(app.query, "p");
+        assert_eq!(app.mode, Mode::Search);
     }
 
     #[test]

@@ -266,7 +266,9 @@ Keys:
   h/l or Left/Right              horizontal scroll session metadata
   0                              reset horizontal scroll
   e                              toggle exec entries for replay
-  y                              copy `codex resume <session-id>` to clipboard
+  y                              copy `cd <cwd> && claude --resume <id>` to clipboard
+                                 (a subsession copies its parent session's command)
+  p                              select the parent session of a subsession
   ?                              show help
   q, Ctrl-C                      quit
   Esc                            quit normally; leave search or help when open",
@@ -487,6 +489,8 @@ mod tests {
         assert!(root.contains("Show subsessions from the canonical index"));
         assert!(root.contains("Initially show exec records in replay"));
         assert!(root.contains("e                              toggle exec entries for replay"));
+        assert!(root.contains("copy `cd <cwd> && claude --resume <id>` to clipboard"));
+        assert!(root.contains("p                              select the parent session"));
         assert!(!root.ends_with('\n'));
 
         let index = help_text(HelpTopic::Index);

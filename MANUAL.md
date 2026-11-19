@@ -48,14 +48,13 @@ Each row reads `date | cwd | branch | repository | title`; a missing value is
 shown as `-`. The date, working directory, branch, and repository have fixed
 column widths. Values that exceed their column are shortened with `…`; the
 title remains unshortened and can be viewed with horizontal scrolling. Press `i`
-to see the full values of every field. Badge
-spaces are reserved even when a badge is absent, keeping the columns aligned.
+to see the full values of every field. Badge positions use one character each, with blank spaces for absent badges to keep the columns aligned. The bottom legend explains their colors and meanings.
 
 The default view hides subsessions and rows without a non-empty first user
 message. `--include-subsessions` and `--include-empty-messages` change only
 the visible set; the canonical index always stores every valid session.
 When `--include-subsessions` is active, every list row is prefixed with
-`[MAIN]` or `[SUB]`. A `[CONT]` badge marks a session whose transcript records
+`+` (main) or `-` (sub). A `>` badge marks a session whose transcript records
 that it was continued in another session; it is shown in every view.
 
 ### Resume command
@@ -65,14 +64,14 @@ that it was continued in another session; it is shown in every view.
 as `'\''`. When the session has no recorded `cwd`, the command is only
 `claude --resume <session-id>`.
 
-A subsession has no resumable id of its own. On a `[SUB]` row, `y` copies the
+A subsession has no resumable id of its own. On a `-` row, `y` copies the
 command of its parent main session. If the parent is not among the sessions
 loaded in the current view, the status line shows `parent session is not
 indexed in this view`.
 
 ### Parent navigation
 
-`p` on a `[SUB]` row selects the parent `[MAIN]` row in the current list. The
+`p` on a `-` row selects the parent `+` row in the current list. The
 search query is kept, so a parent that the current search filters out cannot
 be selected; the status line then shows `parent session is not in the current
 list`. On a main session the status line shows `selected session has no

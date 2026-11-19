@@ -53,10 +53,10 @@ repository. Press `/` to search, `Tab` to select metadata or a content scope,
 and `e` to choose whether the next replay shows Bash commands.
 
 - `y` copies `cd '<cwd>' && claude --resume <session-id>`.
-- With `--include-subsessions`, rows are labelled `[MAIN]` or `[SUB]`. On a
-  `[SUB]` row, `p` selects its parent session and `y` copies the parent's
+- With `--include-subsessions`, rows are labelled `+` (main) or `-` (sub). On a
+  `-` row, `p` selects its parent session and `y` copies the parent's
   resume command.
-- `[CONT]` marks a session that Claude Code continued in another session.
+- `>` marks a session that Claude Code continued in another session.
 
 See the [manual](MANUAL.md) for every key binding and the FTS query syntax.
 

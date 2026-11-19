@@ -534,7 +534,7 @@ fn render(frame: &mut Frame, app: &mut SelectorApp) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(frame.area());
 
@@ -733,7 +733,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     }
     .gray();
 
-    frame.render_widget(footer, area);
+    let legend = Line::from(vec![
+        Span::raw(" badges: "),
+        Span::styled("+", Style::default().fg(Color::Cyan)),
+        Span::raw(" main  "),
+        Span::styled("-", Style::default().fg(Color::Yellow)),
+        Span::raw(" sub  "),
+        Span::styled(">", Style::default().fg(Color::Magenta)),
+        Span::raw(" continued"),
+    ]);
+    frame.render_widget(Paragraph::new(vec![legend, footer]), area);
 }
 
 fn render_help(frame: &mut Frame) {
@@ -745,7 +754,7 @@ fn render_help(frame: &mut Frame) {
         ),
         Line::raw(""),
         Line::raw("Left pane shows date, title, cwd, branch, and repository."),
-        Line::raw("[CONT] marks a session that was continued in another session."),
+        Line::raw("Badges: + main, - sub, > continued in another session."),
         Line::raw("Right pane shows the selected session's first user message."),
         Line::raw(""),
         Line::raw("Focus"),
@@ -829,17 +838,17 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
     let mut segments = Vec::new();
     if show_subsession_badge {
         let (label, style) = if row.is_subsession {
-            ("[SUB]  ", Style::default().fg(Color::Yellow))
+            ("-", Style::default().fg(Color::Yellow))
         } else {
-            ("[MAIN] ", Style::default().fg(Color::Cyan))
+            ("+", Style::default().fg(Color::Cyan))
         };
         segments.push((label.to_string(), style));
     }
     segments.push((
         if row.continued_in_session_id.is_some() {
-            "[CONT] "
+            ">"
         } else {
-            "       "
+            " "
         }
         .to_string(),
         Style::default().fg(Color::Magenta),
@@ -1081,13 +1090,13 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(positions(&first), positions(&second));
-            assert!(first.contains("[CONT]"));
+            assert!(first.starts_with(if show_subsessions { "+>" } else { ">" }));
             assert!(first.contains('…'));
             assert!(first.ends_with(" | A long title"));
-            assert!(!second.contains("[CONT]"));
+            assert!(second.starts_with(if show_subsessions { "- " } else { " " }));
             if show_subsessions {
-                assert!(first.starts_with("[MAIN] [CONT] "));
-                assert!(second.starts_with("[SUB]         "));
+                assert!(first.starts_with("+>"));
+                assert!(second.starts_with("- "));
             }
         }
     }
@@ -1153,7 +1162,7 @@ mod tests {
     #[test]
     fn scrolled_segments_preserve_text_after_horizontal_offset() {
         let rows = sample_rows();
-        let line = scrolled_segments(&metadata_segments(&rows[1], false), 20);
+        let line = scrolled_segments(&metadata_segments(&rows[1], false), 14);
         let text = line
             .spans
             .into_iter()
@@ -1342,10 +1351,10 @@ mod tests {
 
         render_at(&mut app, 100, 18);
         app.handle_key(key(KeyCode::Char('d')));
-        assert_eq!(app.message_scroll, 7);
+        assert_eq!(app.message_scroll, 6);
 
         app.handle_key(key(KeyCode::Char('G')));
-        assert_eq!(app.message_scroll, 16);
+        assert_eq!(app.message_scroll, 17);
     }
 
     #[test]
@@ -1356,7 +1365,7 @@ mod tests {
 
         render_at(&mut app, 100, 18);
         app.handle_key(key(KeyCode::Char('d')));
-        assert_eq!(app.selected_index(), Some(7));
+        assert_eq!(app.selected_index(), Some(6));
 
         app.handle_key(key(KeyCode::Char('u')));
         assert_eq!(app.selected_index(), Some(0));
@@ -1364,7 +1373,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('G')));
         render_at(&mut app, 100, 18);
         assert_eq!(app.selected_index(), Some(19));
-        assert_eq!(app.list_state.offset(), 6);
+        assert_eq!(app.list_state.offset(), 7);
     }
 
     #[test]

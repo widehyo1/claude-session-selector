@@ -86,6 +86,10 @@ pub(crate) struct SelectorApp {
     message_page_height: u16,
     message_max_scroll: u16,
     show_help: bool,
+    show_details: bool,
+    details_scroll: u16,
+    details_max_scroll: u16,
+    details_page_height: u16,
     exec_visibility: ExecVisibility,
     status: Option<String>,
 }
@@ -117,6 +121,10 @@ impl SelectorApp {
             message_page_height: 1,
             message_max_scroll: 0,
             show_help: false,
+            show_details: false,
+            details_scroll: 0,
+            details_max_scroll: 0,
+            details_page_height: 1,
             exec_visibility,
             status: None,
         })
@@ -341,6 +349,36 @@ impl SelectorApp {
             return Some(SelectorAction::Quit);
         }
 
+        if self.show_details {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => self.show_details = false,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.details_scroll = self
+                        .details_scroll
+                        .saturating_add(1)
+                        .min(self.details_max_scroll)
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.details_scroll = self.details_scroll.saturating_sub(1)
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    self.details_scroll = self
+                        .details_scroll
+                        .saturating_add(half_page_height(self.details_page_height))
+                        .min(self.details_max_scroll)
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    self.details_scroll = self
+                        .details_scroll
+                        .saturating_sub(half_page_height(self.details_page_height))
+                }
+                KeyCode::Char('g') | KeyCode::Home => self.details_scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => self.details_scroll = self.details_max_scroll,
+                _ => {}
+            }
+            return None;
+        }
+
         if self.show_help {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => self.show_help = false,
@@ -364,6 +402,13 @@ impl SelectorApp {
                 }
                 KeyCode::Char('?') => {
                     self.show_help = true;
+                    None
+                }
+                KeyCode::Char('i') if key.modifiers.is_empty() => {
+                    if self.selected_row().is_some() {
+                        self.show_details = true;
+                        self.details_scroll = 0;
+                    }
                     None
                 }
                 KeyCode::Char('y') => {
@@ -506,6 +551,8 @@ fn render(frame: &mut Frame, app: &mut SelectorApp) {
 
     if app.show_help {
         render_help(frame);
+    } else if app.show_details {
+        render_details(frame, app);
     }
 }
 
@@ -666,6 +713,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Tab focus "),
             Span::raw(" / search "),
             Span::raw(" Enter replay "),
+            Span::raw(" i details "),
             Span::raw(" e exec "),
             Span::raw(" y copy-resume "),
             Span::raw(" p parent "),
@@ -721,6 +769,8 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  Esc             leave search/help or quit"),
         Line::raw(""),
         Line::raw("Other"),
+        Line::raw("  i               show full metadata for the selected session"),
+        Line::raw("                  j/k, d/u, g/G scroll; i/Esc/q close"),
         Line::raw("  Enter           replay the selected jsonl path"),
         Line::raw("                  return from replay to this selector when replay exits"),
         Line::raw("  e               toggle exec entries for the next replay"),
@@ -737,6 +787,39 @@ fn render_help(frame: &mut Frame) {
     frame.render_widget(help, area);
 }
 
+fn details_text(row: &SessionRow) -> String {
+    format!(
+        "Date: {}\n\nTitle: {}\n\nWorking directory: {}\n\nBranch: {}\n\nRepository: {}",
+        dash_empty(&session_date(row)),
+        dash_empty(row.title.as_deref().unwrap_or_default()),
+        dash_empty(row.cwd.as_deref().unwrap_or_default()),
+        dash_empty(row.branch.as_deref().unwrap_or_default()),
+        dash_empty(row.repository_url.as_deref().unwrap_or_default()),
+    )
+}
+
+fn render_details(frame: &mut Frame, app: &mut SelectorApp) {
+    let Some(text) = app.selected_row().map(details_text) else {
+        return;
+    };
+    let area = centered_rect(80, 80, frame.area());
+    let content = pane_content_area(area);
+    app.details_page_height = content.height.max(1);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    app.details_max_scroll =
+        bottom_scroll_offset(paragraph.line_count(content.width), content.height);
+    app.details_scroll = app.details_scroll.min(app.details_max_scroll);
+    let paragraph = paragraph
+        .block(
+            Block::new()
+                .title(" Session details (i/Esc/q close) ")
+                .borders(Borders::ALL),
+        )
+        .scroll((app.details_scroll, 0));
+    frame.render_widget(Clear, area);
+    frame.render_widget(paragraph, area);
+}
+
 fn metadata_line(row: &SessionRow, show_subsession_badge: bool, scroll: usize) -> Line<'static> {
     let segments = metadata_segments(row, show_subsession_badge);
     scrolled_segments(&segments, scroll)
@@ -746,42 +829,74 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
     let mut segments = Vec::new();
     if show_subsession_badge {
         let (label, style) = if row.is_subsession {
-            ("[SUB] ", Style::default().fg(Color::Yellow))
+            ("[SUB]  ", Style::default().fg(Color::Yellow))
         } else {
             ("[MAIN] ", Style::default().fg(Color::Cyan))
         };
         segments.push((label.to_string(), style));
     }
-    if row.continued_in_session_id.is_some() {
-        segments.push(("[CONT] ".to_string(), Style::default().fg(Color::Magenta)));
-    }
+    segments.push((
+        if row.continued_in_session_id.is_some() {
+            "[CONT] "
+        } else {
+            "       "
+        }
+        .to_string(),
+        Style::default().fg(Color::Magenta),
+    ));
     segments.extend([
         (
-            dash_empty(&session_date(row)).to_string(),
+            fixed_column(&session_date(row), 10),
             Style::default().fg(Color::Cyan),
+        ),
+        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
+        (
+            fixed_column(row.cwd.as_deref().unwrap_or_default(), 24),
+            Style::default().fg(Color::Green),
+        ),
+        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
+        (
+            fixed_column(row.branch.as_deref().unwrap_or_default(), 16),
+            Style::default().fg(Color::Yellow),
+        ),
+        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
+        (
+            fixed_column(row.repository_url.as_deref().unwrap_or_default(), 28),
+            Style::default().fg(Color::Magenta),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
         (
             dash_empty(row.title.as_deref().unwrap_or_default()).to_string(),
             Style::default().fg(Color::White),
         ),
-        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
-        (
-            dash_empty(row.cwd.as_deref().unwrap_or_default()).to_string(),
-            Style::default().fg(Color::Green),
-        ),
-        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
-        (
-            dash_empty(row.branch.as_deref().unwrap_or_default()).to_string(),
-            Style::default().fg(Color::Yellow),
-        ),
-        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
-        (
-            dash_empty(row.repository_url.as_deref().unwrap_or_default()).to_string(),
-            Style::default().fg(Color::Magenta),
-        ),
     ]);
     segments
+}
+
+// Widths are terminal cells, not bytes or Unicode scalar values.
+fn fixed_column(value: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let value = dash_empty(value);
+    if UnicodeWidthStr::width(value) <= width {
+        return format!(
+            "{}{}",
+            value,
+            " ".repeat(width - UnicodeWidthStr::width(value))
+        );
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in value.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + char_width > width.saturating_sub(1) {
+            break;
+        }
+        result.push(ch);
+        used += char_width;
+    }
+    result.push('…');
+    result.push_str(&" ".repeat(width - used - 1));
+    result
 }
 
 #[cfg(test)]
@@ -950,49 +1065,31 @@ mod tests {
     }
 
     #[test]
-    fn metadata_plain_uses_requested_column_order() {
-        let rows = sample_rows();
-
-        assert_eq!(
-            metadata_plain(&rows[1], false),
-            "2026-05-28 | - | /repo/beta | feature/search | https://git.example/beta.git"
-        );
-
-        let mut titled = rows[0].clone();
-        titled.title = Some("Parser fix".to_string());
-        assert_eq!(
-            metadata_plain(&titled, false),
-            "2026-05-27 | Parser fix | /repo/alpha | main | https://git.example/alpha.git"
-        );
-    }
-
-    #[test]
-    fn continued_badge_is_shown_without_subsession_option() {
+    fn metadata_columns_align_with_badges_and_long_values() {
+        use unicode_width::UnicodeWidthStr;
         let mut rows = sample_rows();
-        rows[0].continued_in_session_id = Some("next".to_string());
-
-        assert!(metadata_plain(&rows[0], false).starts_with("[CONT] 2026-05-27 | "));
-        assert!(metadata_plain(&rows[0], true).starts_with("[MAIN] [CONT] 2026-05-27 | "));
-        assert!(!metadata_plain(&rows[1], false).contains("[CONT]"));
-    }
-
-    #[test]
-    fn metadata_badges_are_shown_only_when_subsessions_are_included() {
-        let mut rows = sample_rows();
+        rows[0].continued_in_session_id = Some("next".into());
+        rows[0].cwd = Some("/a/very/long/한글/path/that/exceeds/the/column".into());
+        rows[0].title = Some("A long title".into());
         rows[1].is_subsession = true;
-
-        assert_eq!(
-            metadata_plain(&rows[0], false),
-            "2026-05-27 | - | /repo/alpha | main | https://git.example/alpha.git"
-        );
-        assert_eq!(
-            metadata_plain(&rows[0], true),
-            "[MAIN] 2026-05-27 | - | /repo/alpha | main | https://git.example/alpha.git"
-        );
-        assert_eq!(
-            metadata_plain(&rows[1], true),
-            "[SUB] 2026-05-28 | - | /repo/beta | feature/search | https://git.example/beta.git"
-        );
+        for show_subsessions in [false, true] {
+            let first = metadata_plain(&rows[0], show_subsessions);
+            let second = metadata_plain(&rows[1], show_subsessions);
+            let positions = |line: &str| {
+                line.match_indices(" | ")
+                    .map(|(i, _)| UnicodeWidthStr::width(&line[..i]))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(positions(&first), positions(&second));
+            assert!(first.contains("[CONT]"));
+            assert!(first.contains('…'));
+            assert!(first.ends_with(" | A long title"));
+            assert!(!second.contains("[CONT]"));
+            if show_subsessions {
+                assert!(first.starts_with("[MAIN] [CONT] "));
+                assert!(second.starts_with("[SUB]         "));
+            }
+        }
     }
 
     #[test]
@@ -1056,7 +1153,7 @@ mod tests {
     #[test]
     fn scrolled_segments_preserve_text_after_horizontal_offset() {
         let rows = sample_rows();
-        let line = scrolled_segments(&metadata_segments(&rows[1], false), 17);
+        let line = scrolled_segments(&metadata_segments(&rows[1], false), 20);
         let text = line
             .spans
             .into_iter()
@@ -1285,6 +1382,28 @@ mod tests {
         app.handle_key(key(KeyCode::Enter));
         app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
         assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+    }
+
+    #[test]
+    fn details_show_full_values_and_scroll_without_changing_selection() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        let long_path = format!("/{}", "long-directory/".repeat(30));
+        app.filtered[0].cwd = Some(long_path.clone());
+        assert!(details_text(&app.filtered[0]).contains(&long_path));
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(app.show_details);
+        render_at(&mut app, 50, 15);
+        assert!(app.details_max_scroll > 0);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.details_scroll, app.details_max_scroll);
+        assert_eq!(app.selected_index(), Some(0));
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.details_scroll, 0);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.show_details);
+        app.list_state.select(None);
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(!app.show_details);
     }
 
     #[test]

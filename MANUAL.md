@@ -36,6 +36,7 @@ not a shell command.
 | `h` / `l`, Left / Right | Horizontally scroll session metadata. |
 | `0` | Reset metadata horizontal scroll. |
 | `/` | Start a search. |
+| `i` | Show full metadata for the selected session; use `j` / `k`, `d` / `u`, or `g` / `G` to scroll and `i`, `Esc`, or `q` to close. |
 | `e` | Toggle initial Bash visibility for the next replay. |
 | `Enter` | Replay the selected session. |
 | `y` | Copy `cd '<cwd>' && claude --resume <session-id>`. |
@@ -43,8 +44,12 @@ not a shell command.
 | `?` | Open help. |
 | `q`, Ctrl-C, Esc | Quit, or leave search/help when active. |
 
-Each row reads `date | title | cwd | branch | repository`; a missing value is
-shown as `-`.
+Each row reads `date | cwd | branch | repository | title`; a missing value is
+shown as `-`. The date, working directory, branch, and repository have fixed
+column widths. Values that exceed their column are shortened with `…`; the
+title remains unshortened and can be viewed with horizontal scrolling. Press `i`
+to see the full values of every field. Badge
+spaces are reserved even when a badge is absent, keeping the columns aligned.
 
 The default view hides subsessions and rows without a non-empty first user
 message. `--include-subsessions` and `--include-empty-messages` change only

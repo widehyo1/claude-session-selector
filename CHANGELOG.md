@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Align session metadata columns and place the title last. Long fixed-width
+  fields are shortened in the list; press `i` to inspect their full values.
+
 ## 0.2.0
 
 Breaking changes:

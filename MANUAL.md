@@ -148,6 +148,136 @@ run it. Other consistency checks remain enabled on every refresh. Use
 requires the internal refresh and cannot be combined with `--no-refresh` or
 `--record-command`.
 
+### Execution times
+
+`exec_events` stores two timestamps as written in the transcript (ISO 8601,
+UTC):
+
+| Column | Source |
+| --- | --- |
+| `called_at` | The record containing the Bash `tool_use`. |
+| `result_at` | The record containing the `tool_result` stored in `output`. |
+
+Claude Code does not record when the process itself started or exited. The
+interval between the two columns therefore also contains permission waits,
+hooks, queueing behind other calls, and any time the machine slept. For the
+execution itself, use the [exec timing hook](#exec-timing-hook).
+
+`result_at` does not always mean that the command finished:
+
+- For a command started in the background, it is when the launch was reported.
+- For a command moved to the background while running, for example at its
+  timeout, it is when it was moved.
+- A denied or blocked call also has one, although it never ran.
+
+When a call has several results, the last one supplies both `output` and
+`result_at`. A missing result or timestamp is `NULL`. A continued session
+contains copies of earlier calls, so deduplicate by `call_id` before adding up
+times across sessions.
+
+```sql
+SELECT call_id, called_at, result_at,
+       (julianday(result_at) - julianday(called_at)) * 86400.0 AS seconds
+FROM exec_events
+ORDER BY seconds DESC;
+```
+
+## Exec timing hook
+
+An optional Claude Code hook records how long each Bash call really ran, as
+raw input for judging session efficiency. One row is one Bash tool call that
+started and returned; child processes are not counted separately.
+
+```text
+PostToolUse, PostToolUseFailure
+  -> ~/.claude/exec-log/exec.jsonl      appended by the hook
+  -> ~/.claude/exec-log/exec.sqlite3    moved on each refresh, after indexing
+```
+
+### Install
+
+The hook needs `jq`. Run from the repository:
+
+```bash
+mkdir -p -m 700 ~/.claude/exec-log
+cp hooks/exec-log.jq ~/.claude/exec-log/exec.jq
+```
+
+Append this entry to both `hooks.PostToolUse` and `hooks.PostToolUseFailure`
+in `~/.claude/settings.json`, keeping the entries already there:
+
+```json
+{
+  "matcher": "Bash",
+  "hooks": [
+    {
+      "type": "command",
+      "timeout": 5,
+      "command": "jq -c -f \"$HOME/.claude/exec-log/exec.jq\" >> \"$HOME/.claude/exec-log/exec.jsonl\" || true"
+    }
+  ]
+}
+```
+
+`select-claude-session` and `select-claude-session index` then store the log
+whenever they refresh. `--no-refresh` leaves it untouched, and so does
+`--record-command` unless that command does the same. The log directory is
+always `exec-log` next to the sessions root, independent of `--db` and
+`--output`.
+
+### Stored data
+
+`exec_timings` holds no command or output text.
+
+| Column | Meaning |
+| --- | --- |
+| `tool_use_id` | Primary key; equals `exec_events.call_id`. |
+| `session_id` | The session that ran the call; for a subagent, its main session. |
+| `agent_id` | The subagent that ran the call, or `NULL`. |
+| `started_at_ms` | `ended_at_ms - duration_ms`, Unix milliseconds. |
+| `ended_at_ms` | When the hook ran, Unix milliseconds. |
+| `duration_ms` | Claude Code's execution time, without permission-prompt and hook time. |
+| `outcome` | `ok`, `error`, `interrupted`, or `backgrounded`. |
+| `background_task_id` | Set when the call was backgrounded. |
+
+Join it to the index to split a call into waiting and running:
+
+```sql
+-- sqlite3 -readonly ~/claude-session-info.sqlite3
+ATTACH 'file:/Users/me/.claude/exec-log/exec.sqlite3?mode=ro' AS timing;
+WITH calls AS (
+  SELECT call_id, min(called_at) AS called_at, max(result_at) AS result_at
+  FROM exec_events
+  GROUP BY call_id
+)
+SELECT t.session_id, t.tool_use_id, t.outcome,
+       t.started_at_ms / 1000.0 - unixepoch(c.called_at, 'subsec') AS wait_seconds,
+       t.duration_ms / 1000.0 AS run_seconds,
+       unixepoch(c.result_at, 'subsec') - t.ended_at_ms / 1000.0 AS report_seconds
+FROM timing.exec_timings AS t
+JOIN calls AS c ON c.call_id = t.tool_use_id;
+```
+
+### Limitations
+
+- **Not retroactive.** Only calls made after the hook was installed have a
+  row. Earlier sessions have just `called_at` and `result_at`, and their
+  execution time cannot be recovered.
+- The timings cannot be rebuilt either. They are kept outside the index so that
+  `index --rebuild` or deleting the index does not lose them; deleting
+  `exec.sqlite3` does.
+- For `backgrounded` rows the end and duration describe the launch or the move
+  to the background. When the command finished is not recorded.
+- A call that was denied, or still running when Claude Code was killed, has no
+  row. A missing row alone therefore does not say why.
+- Start and end were within about 25 ms of the real process in a test on Claude
+  Code 2.1.323. The first call of a session also included about 1 s of shell
+  setup.
+- Calls can overlap, so summed `duration_ms` can exceed the elapsed time.
+
+A log file is deleted on the first refresh at least 60 seconds after its lines
+were stored. A file with unreadable lines is kept as `rejected.*.jsonl`.
+
 ## Replay
 
 ```bash
@@ -192,7 +322,13 @@ The default database path is unchanged. A 0.1.0 database is detected and
 rebuilt from the transcripts on the next refresh; `--no-refresh` refuses to
 open it until then.
 
-The crate uses `rusqlite 0.40.1` with bundled SQLite. Schema v1 contains the
+Version 0.3.0 upgrades schema v1 to v2 on the next refresh. It adds the
+execution time columns and reparses every transcript once to fill them,
+keeping the existing keys; that refresh reports the files as changed. As on
+any refresh, sessions whose transcript was deleted are removed. `--no-refresh`
+refuses a v1 index until it is upgraded, and 0.2.x refuses to open a v2 index.
+
+The crate uses `rusqlite 0.40.1` with bundled SQLite. Schema v2 contains the
 STRICT tables `index_metadata`, `source_files`, `sessions`, `exec_events`, and
 `message_events`, plus a contentless-delete FTS5 index. Besides the codex
 selector's columns, `sessions` stores `title`, `parent_session_id`,
@@ -204,5 +340,5 @@ Source, session, event, and message keys remain stable across ordinary
 incremental updates; rebuilds, renames, and root changes may assign new keys.
 All writes validate foreign keys and SQLite integrity inside one immediate
 transaction. A dirty or inconsistent FTS index is rebuilt without replacing
-canonical session keys. `--no-refresh` requires schema v1; an unknown schema
+canonical session keys. `--no-refresh` requires schema v2; an unknown schema
 requires `index --rebuild`, and a newer schema is never overwritten.

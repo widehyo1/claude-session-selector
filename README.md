@@ -68,9 +68,12 @@ See the [manual](MANUAL.md) for every key binding and the FTS query syntax.
 
 - Refreshing is incremental: unchanged JSONL files are not reparsed.
 - The index stores sessions, user and agent messages, and Bash commands with
-  their output.
+  their output and their [call and result times](MANUAL.md#execution-times).
 - Subagent transcripts and sessions without a typed first prompt are stored but
   hidden by default; the corresponding selector options reveal them.
+- An optional hook records the real run time of each Bash call; refreshing
+  moves it to `~/.claude/exec-log/exec.sqlite3`. It is
+  [not retroactive](MANUAL.md#exec-timing-hook).
 - All index writes are transactional. Replay reads the selected JSONL directly.
 - The index and replay operate locally; this tool has no hosted service or
   session upload path.

@@ -214,11 +214,13 @@ impl SearchIndex {
         fts::verify_runtime(&conn)?;
         match schema::detect_schema(&conn)? {
             SchemaState::Current { .. } => {}
-            SchemaState::Empty | SchemaState::Legacy | SchemaState::Unknown { version: 0, .. } => {
-                bail!(
-                    "search index schema 1 is required; refresh the index or run `select-claude-session index`"
-                )
-            }
+            SchemaState::Empty
+            | SchemaState::Legacy
+            | SchemaState::Outdated { .. }
+            | SchemaState::Unknown { version: 0, .. } => bail!(
+                "search index schema {} is required; refresh the index or run `select-claude-session index`",
+                schema::SCHEMA_VERSION
+            ),
             SchemaState::Future { version } => bail!(
                 "index schema version {version} is newer than supported version {}; refusing to open it",
                 schema::SCHEMA_VERSION

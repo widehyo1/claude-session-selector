@@ -322,7 +322,7 @@ fn update_session(tx: &Transaction<'_>, session_key: i64, row: &SessionRow) -> R
 fn load_execs(tx: &Transaction<'_>, session_key: i64) -> Result<BTreeMap<usize, StoredExec>> {
     let mut stmt = tx.prepare(
         "SELECT exec_key, session_path, session_id, event_index, call_id,
-                kind, name, command, output
+                kind, name, command, output, called_at, result_at
          FROM exec_events
          WHERE session_key = ?1
          ORDER BY event_index",
@@ -349,6 +349,8 @@ fn load_execs(tx: &Transaction<'_>, session_key: i64) -> Result<BTreeMap<usize, 
                     name: row.get(6)?,
                     command: row.get(7)?,
                     output: row.get(8)?,
+                    called_at: row.get(9)?,
+                    result_at: row.get(10)?,
                 },
             },
         ))
@@ -463,8 +465,8 @@ fn insert_exec(tx: &Transaction<'_>, session_key: i64, event: &ExecEvent) -> Res
     Ok(tx.query_row(
         "INSERT INTO exec_events(
              session_path, session_id, event_index, call_id,
-             kind, name, command, output, session_key
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             kind, name, command, output, session_key, called_at, result_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          RETURNING exec_key",
         params![
             event.session_path.to_string_lossy().as_ref(),
@@ -477,6 +479,8 @@ fn insert_exec(tx: &Transaction<'_>, session_key: i64, event: &ExecEvent) -> Res
             event.command.as_str(),
             event.output.as_str(),
             session_key,
+            event.called_at.as_deref(),
+            event.result_at.as_deref(),
         ],
         |row| row.get(0),
     )?)
@@ -491,8 +495,10 @@ fn update_exec(tx: &Transaction<'_>, exec_key: i64, event: &ExecEvent) -> Result
              kind = ?4,
              name = ?5,
              command = ?6,
-             output = ?7
-         WHERE exec_key = ?8",
+             output = ?7,
+             called_at = ?8,
+             result_at = ?9
+         WHERE exec_key = ?10",
         params![
             event.session_path.to_string_lossy().as_ref(),
             event.session_id.as_deref(),
@@ -501,6 +507,8 @@ fn update_exec(tx: &Transaction<'_>, exec_key: i64, event: &ExecEvent) -> Result
             event.name.as_deref(),
             event.command.as_str(),
             event.output.as_str(),
+            event.called_at.as_deref(),
+            event.result_at.as_deref(),
             exec_key,
         ],
     )?;

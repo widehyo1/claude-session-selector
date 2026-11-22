@@ -300,7 +300,10 @@ Options:
   -V, --version                  Show version
 
 The canonical index always stores all valid sessions and exec events. Selector
-visibility is controlled by selector options rather than index contents.",
+visibility is controlled by selector options rather than index contents.
+
+After indexing, exec timings logged by the optional hook in exec-log/ next to
+the sessions root are moved to exec-log/exec.sqlite3.",
         version = env!("CARGO_PKG_VERSION")
     )
 }

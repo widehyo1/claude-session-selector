@@ -8,7 +8,7 @@ use rusqlite::{Connection, Transaction, params};
 
 use super::fts;
 
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 pub(crate) const TABLE_DDL: &str = r#"
 CREATE TABLE index_metadata (
@@ -66,6 +66,8 @@ CREATE TABLE exec_events (
     exec_key INTEGER PRIMARY KEY,
     session_key INTEGER NOT NULL
         REFERENCES sessions(session_key) ON DELETE CASCADE,
+    called_at TEXT,
+    result_at TEXT,
     UNIQUE (session_key, event_index)
 ) STRICT;
 
@@ -80,6 +82,12 @@ CREATE TABLE message_events (
 ) STRICT;
 "#;
 
+// Appended last so that migrated and newly created tables have the same column order.
+const MIGRATE_V1_DDL: &str = r#"
+ALTER TABLE exec_events ADD COLUMN called_at TEXT;
+ALTER TABLE exec_events ADD COLUMN result_at TEXT;
+"#;
+
 pub(crate) const INDEX_DDL: &str = r#"
 CREATE INDEX IF NOT EXISTS sessions_timestamp_idx ON sessions(timestamp);
 CREATE INDEX IF NOT EXISTS sessions_cwd_idx ON sessions(cwd);
@@ -92,6 +100,8 @@ CREATE INDEX IF NOT EXISTS exec_events_session_id_idx ON exec_events(session_id)
 pub(crate) enum SchemaState {
     Empty,
     Legacy,
+    // Schema v1: upgraded in place, then filled from the transcripts.
+    Outdated { sessions_root: PathBuf },
     Current { sessions_root: PathBuf },
     Future { version: i64 },
     Unknown { version: i64, reason: String },
@@ -118,14 +128,17 @@ pub(crate) fn detect_schema(conn: &Connection) -> Result<SchemaState> {
     if version == 0 && is_legacy(conn, &tables)? {
         return Ok(SchemaState::Legacy);
     }
-    if version != SCHEMA_VERSION {
+    if !(1..=SCHEMA_VERSION).contains(&version) {
         return Ok(SchemaState::Unknown {
             version,
             reason: format!("expected schema version {SCHEMA_VERSION}, found {version}"),
         });
     }
-    match validate_current(conn, &tables).and_then(|()| current_root(conn)) {
-        Ok(sessions_root) => Ok(SchemaState::Current { sessions_root }),
+    match validate_schema(conn, &tables, version).and_then(|()| current_root(conn)) {
+        Ok(sessions_root) if version == SCHEMA_VERSION => {
+            Ok(SchemaState::Current { sessions_root })
+        }
+        Ok(sessions_root) => Ok(SchemaState::Outdated { sessions_root }),
         Err(error) => Ok(SchemaState::Unknown {
             version,
             reason: error.to_string(),
@@ -241,7 +254,7 @@ fn is_legacy(conn: &Connection, tables: &BTreeSet<String>) -> Result<bool> {
     Ok(true)
 }
 
-fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> {
+fn validate_schema(conn: &Connection, tables: &BTreeSet<String>, version: i64) -> Result<()> {
     let mut expected = BTreeSet::from([
         "exec_events".to_owned(),
         "fts_sync_state".to_owned(),
@@ -256,10 +269,10 @@ fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> 
         "source_files".to_owned(),
     ]);
     if tables != &expected {
-        bail!("schema v1 table set does not match the required schema");
+        bail!("table set does not match the canonical schema");
     }
     expected.clear();
-    validate_canonical_tables(conn)?;
+    validate_canonical_tables(conn, version)?;
     if columns(conn, "message_events")?
         != expected_columns(&[
             ("event_index", "INTEGER", true, 0),
@@ -269,7 +282,7 @@ fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> 
             ("session_key", "INTEGER", true, 0),
         ])
     {
-        bail!("message_events columns do not match schema v1");
+        bail!("message_events columns do not match the canonical schema");
     }
     let strict = conn.query_row(
         "SELECT strict FROM pragma_table_list WHERE name = 'message_events'",
@@ -285,7 +298,7 @@ fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> 
         |row| row.get::<_, String>(0),
     )?;
     if !normalize_sql(&message_sql).contains("CHECK (role IN ('user', 'agent'))") {
-        bail!("message_events role CHECK does not match schema v1");
+        bail!("message_events role CHECK does not match the canonical schema");
     }
     require_unique(conn, "message_events", &["session_key", "event_index"])?;
     require_foreign_key(
@@ -301,7 +314,25 @@ fn validate_current(conn: &Connection, tables: &BTreeSet<String>) -> Result<()> 
     Ok(())
 }
 
-fn validate_canonical_tables(conn: &Connection) -> Result<()> {
+fn validate_canonical_tables(conn: &Connection, version: i64) -> Result<()> {
+    let mut exec_columns = vec![
+        ("session_path", "TEXT", true, 0),
+        ("session_id", "TEXT", false, 0),
+        ("event_index", "INTEGER", true, 0),
+        ("call_id", "TEXT", false, 0),
+        ("kind", "TEXT", true, 0),
+        ("name", "TEXT", false, 0),
+        ("command", "TEXT", true, 0),
+        ("output", "TEXT", true, 0),
+        ("exec_key", "INTEGER", false, 1),
+        ("session_key", "INTEGER", true, 0),
+    ];
+    if version >= 2 {
+        exec_columns.extend([
+            ("called_at", "TEXT", false, 0),
+            ("result_at", "TEXT", false, 0),
+        ]);
+    }
     let expected = BTreeMap::from([
         (
             "index_metadata",
@@ -342,21 +373,7 @@ fn validate_canonical_tables(conn: &Connection) -> Result<()> {
                 ("continued_in_session_id", "TEXT", false, 0),
             ]),
         ),
-        (
-            "exec_events",
-            expected_columns(&[
-                ("session_path", "TEXT", true, 0),
-                ("session_id", "TEXT", false, 0),
-                ("event_index", "INTEGER", true, 0),
-                ("call_id", "TEXT", false, 0),
-                ("kind", "TEXT", true, 0),
-                ("name", "TEXT", false, 0),
-                ("command", "TEXT", true, 0),
-                ("output", "TEXT", true, 0),
-                ("exec_key", "INTEGER", false, 1),
-                ("session_key", "INTEGER", true, 0),
-            ]),
-        ),
+        ("exec_events", expected_columns(&exec_columns)),
     ]);
 
     for (table, expected_columns) in expected {
@@ -395,7 +412,7 @@ fn validate_fts_state(conn: &Connection) -> Result<()> {
             ("dirty", "INTEGER", true, 0),
         ])
     {
-        bail!("fts_sync_state columns do not match schema v1");
+        bail!("fts_sync_state columns do not match the canonical schema");
     }
     let strict = conn.query_row(
         "SELECT strict FROM pragma_table_list WHERE name = 'fts_sync_state'",
@@ -432,7 +449,7 @@ fn validate_fts_table(conn: &Connection) -> Result<()> {
         .map(|column| column.name)
         .collect::<Vec<_>>();
     if actual_names != expected_names {
-        bail!("sessions_fts columns do not match schema v1");
+        bail!("sessions_fts columns do not match the canonical schema");
     }
     let sql = conn.query_row(
         "SELECT sql FROM sqlite_schema
@@ -447,7 +464,7 @@ fn validate_fts_table(conn: &Connection) -> Result<()> {
         .and_then(|statement| statement.split(';').next().map(str::to_owned))
         .context("invalid built-in FTS DDL")?;
     if normalize_sql(&sql) != normalize_sql(&expected) {
-        bail!("sessions_fts DDL does not match schema v1");
+        bail!("sessions_fts DDL does not match the canonical schema");
     }
     Ok(())
 }
@@ -508,7 +525,7 @@ fn validate_fts_triggers(conn: &Connection) -> Result<()> {
                 .is_none_or(|actual| normalize_sql(actual) != normalize_sql(sql))
         })
     {
-        bail!("schema v1 dirty trigger set does not match");
+        bail!("dirty trigger set does not match the canonical schema");
     }
     Ok(())
 }
@@ -598,6 +615,15 @@ pub(crate) fn create_canonical_schema(tx: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn migrate_v1(tx: &Transaction<'_>) -> Result<()> {
+    // Read again under the write lock: another refresh may have migrated since detection.
+    let version = tx.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if version == 1 {
+        tx.execute_batch(MIGRATE_V1_DDL)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_indexes(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch(INDEX_DDL)?;
     Ok(())
@@ -676,10 +702,11 @@ mod tests {
     #[test]
     fn future_schema_is_classified_without_inspection() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        let version = SCHEMA_VERSION + 1;
+        conn.pragma_update(None, "user_version", version).unwrap();
         assert_eq!(
             detect_schema(&conn).unwrap(),
-            SchemaState::Future { version: 2 }
+            SchemaState::Future { version }
         );
     }
 
@@ -709,13 +736,13 @@ mod tests {
         .unwrap();
         tx.execute_batch(
             "CREATE TRIGGER unexpected AFTER INSERT ON sessions BEGIN SELECT 1; END;
-             PRAGMA user_version = 1;",
+             PRAGMA user_version = 2;",
         )
         .unwrap();
         tx.commit().unwrap();
         assert!(matches!(
             detect_schema(&conn).unwrap(),
-            SchemaState::Unknown { version: 1, .. }
+            SchemaState::Unknown { version: 2, .. }
         ));
     }
 
@@ -729,7 +756,7 @@ mod tests {
             [],
         )
         .unwrap();
-        tx.execute_batch("PRAGMA user_version = 1;").unwrap();
+        tx.execute_batch("PRAGMA user_version = 2;").unwrap();
         tx.commit().unwrap();
 
         assert_eq!(

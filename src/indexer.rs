@@ -74,12 +74,17 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
         IndexMode::Incremental => store::load_fingerprints(&conn)?,
         IndexMode::Rebuild => BTreeMap::<PathBuf, StoredSource>::new(),
     };
-    let plan = scan_sources(&root, &stored, mode == IndexMode::Rebuild)?;
+    let migrate = mode == IndexMode::Incremental && matches!(state, SchemaState::Outdated { .. });
+    // A migration must parse unchanged sources too, to fill the new columns.
+    let plan = scan_sources(&root, &stored, migrate || mode == IndexMode::Rebuild)?;
 
     let tx = store::begin_immediate(&mut conn)?;
-    let fts_mode = match (&state, mode) {
-        (SchemaState::Current { .. }, IndexMode::Incremental) => fts::preflight(&tx)?,
-        _ => fts::FtsSyncMode::Populate,
+    if migrate {
+        schema::migrate_v1(&tx)?;
+    }
+    let fts_mode = match mode {
+        IndexMode::Incremental => fts::preflight(&tx)?,
+        IndexMode::Rebuild => fts::FtsSyncMode::Populate,
     };
     let mut delta = match mode {
         IndexMode::Incremental => store::apply_incremental(&tx, &root, &plan)?,
@@ -94,6 +99,7 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
     fts::mark_clean(&tx)?;
     let quick_check = options.quick_check
         || mode == IndexMode::Rebuild
+        || migrate
         || fts_mode != fts::FtsSyncMode::Delta
         || !plan.new_sources.is_empty()
         || !plan.changed_sources.is_empty()
@@ -113,12 +119,12 @@ pub(crate) fn build_index(options: &IndexOptions) -> Result<IndexOutcome> {
 fn choose_mode(state: &SchemaState, root: &Path, rebuild: bool) -> Result<IndexMode> {
     match state {
         SchemaState::Empty | SchemaState::Legacy => Ok(IndexMode::Rebuild),
-        SchemaState::Current { sessions_root }
+        SchemaState::Current { sessions_root } | SchemaState::Outdated { sessions_root }
             if rebuild || sessions_root.to_string_lossy() != root.to_string_lossy() =>
         {
             Ok(IndexMode::Rebuild)
         }
-        SchemaState::Current { .. } => Ok(IndexMode::Incremental),
+        SchemaState::Current { .. } | SchemaState::Outdated { .. } => Ok(IndexMode::Incremental),
         SchemaState::Future { version } => bail!(
             "index schema version {version} is newer than supported version {}; refusing to overwrite it",
             schema::SCHEMA_VERSION
@@ -245,7 +251,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            schema::SCHEMA_VERSION
         );
     }
 
@@ -668,8 +674,89 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            1
+            schema::SCHEMA_VERSION
         );
+    }
+
+    fn downgrade_to_v1(db: &Path) {
+        Connection::open(db)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE exec_events DROP COLUMN called_at;
+                 ALTER TABLE exec_events DROP COLUMN result_at;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn schema_v1_is_backfilled_from_unchanged_sources_with_stable_keys() {
+        let fixture = SessionFixture::new();
+        let source = fixture.project_dir().join("timed.jsonl");
+        let mut call = crate::test_support::bash_call("timed", "pwd");
+        call["timestamp"] = json!("2026-05-28T00:00:01.000Z");
+        let mut result = crate::test_support::tool_result("timed", json!("/repo"));
+        result["timestamp"] = json!("2026-05-28T00:00:03.500Z");
+        fs::write(source, format!("{call}\n{result}\n")).unwrap();
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+
+        let read = || {
+            Connection::open(&db)
+                .unwrap()
+                .query_row(
+                    "SELECT session_key, exec_key, called_at, result_at FROM exec_events",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let fresh = read();
+        assert_eq!(fresh.2.as_deref(), Some("2026-05-28T00:00:01.000Z"));
+        assert_eq!(fresh.3.as_deref(), Some("2026-05-28T00:00:03.500Z"));
+        downgrade_to_v1(&db);
+
+        let outcome = build_index(&options).unwrap();
+        assert_eq!(outcome.summary.mode, IndexMode::Incremental);
+        assert_eq!(outcome.summary.parsed_files, 1);
+        assert_eq!(outcome.delta.updated_exec_keys, [fresh.1]);
+        assert_eq!(read(), fresh);
+        assert_eq!(build_index(&options).unwrap().summary.parsed_files, 0);
+    }
+
+    #[test]
+    fn failed_v1_migration_rolls_back_the_columns_and_version() {
+        let fixture = SessionFixture::new();
+        fixture.write_session_with_exec();
+        let db = fixture.path("index.sqlite3");
+        let options = options(&fixture, db.clone());
+        build_index(&options).unwrap();
+        downgrade_to_v1(&db);
+        // An orphan row fails the foreign key check, which runs after the ALTER.
+        Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 INSERT INTO message_events(event_index, role, content, session_key)
+                 VALUES (0, 'user', 'orphan', 999);",
+            )
+            .unwrap();
+
+        let error = build_index(&options).unwrap_err();
+        assert!(error.to_string().contains("foreign key check failed"));
+        // Still recognized as v1, so neither the columns nor the version were committed.
+        assert!(matches!(
+            detect_schema(&Connection::open(&db).unwrap()).unwrap(),
+            SchemaState::Outdated { .. }
+        ));
     }
 
     #[test]
@@ -885,7 +972,8 @@ mod tests {
 
         let future_db = fixture.path("future.sqlite3");
         let conn = Connection::open(&future_db).unwrap();
-        conn.execute_batch("PRAGMA user_version = 2;").unwrap();
+        conn.pragma_update(None, "user_version", schema::SCHEMA_VERSION + 1)
+            .unwrap();
         drop(conn);
         let mut future_options = options(&fixture, future_db);
         future_options.rebuild = true;

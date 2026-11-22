@@ -14,6 +14,7 @@ use session_event::RecordKind;
 
 mod application;
 mod cli;
+mod exec_log;
 mod indexer;
 mod replay;
 mod selector;
@@ -69,6 +70,10 @@ pub struct ExecEvent {
     pub name: Option<String>,
     pub command: String,
     pub output: String,
+    /// When the `tool_use` record was written; not when the process started.
+    pub called_at: Option<String>,
+    /// When the `tool_result` that supplied `output` was written.
+    pub result_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -397,11 +402,15 @@ fn collect_exec_events(
             name: Some("Bash".to_string()),
             command: call.command,
             output: String::new(),
+            called_at: nonblank_string_field(value, "timestamp"),
+            result_at: None,
         });
     }
     for output in session_event::tool_outputs(value) {
         if let Some(&index) = exec_by_call_id.get(&output.call_id) {
+            // A resumed session can replace an "interrupted" result; keep time and output paired.
             exec_events[index].output = output.output;
+            exec_events[index].result_at = nonblank_string_field(value, "timestamp");
         }
     }
     calls.count()
@@ -885,6 +894,8 @@ mod tests {
                 name: Some("Bash".to_string()),
                 command: "git status".to_string(),
                 output: "clean".to_string(),
+                called_at: Some("2026-11-01T00:00:05.000Z".to_string()),
+                result_at: Some("2026-11-01T00:00:06.000Z".to_string()),
             }]
         );
     }
@@ -918,6 +929,49 @@ mod tests {
             vec![
                 (session_event::MessageRole::User, "count the files"),
                 (session_event::MessageRole::Agent, "there are 3 files"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_times_follow_the_stored_output_and_allow_missing_values() {
+        let layout = layout();
+        let mut call = test_support::bash_call("repeated", "one");
+        call["timestamp"] = "called".into();
+        let mut interrupted = test_support::tool_result("repeated", "interrupted".into());
+        interrupted["timestamp"] = "interrupted".into();
+        let mut finished = test_support::tool_result("repeated", "done".into());
+        finished["timestamp"] = "finished".into();
+        let mut pending = test_support::bash_call("pending", "two");
+        pending["timestamp"] = "pending".into();
+        let records = [
+            call,
+            interrupted,
+            finished,
+            pending,
+            test_support::bash_call("untimed", "three"),
+            test_support::tool_result("untimed", "done".into()),
+        ];
+        fs::write(
+            &layout.main,
+            records.map(|record| record.to_string()).join("\n"),
+        )
+        .unwrap();
+
+        let events = parse_session_file_data(&layout.main, true)
+            .unwrap()
+            .unwrap()
+            .exec_events;
+        let times = events
+            .iter()
+            .map(|event| (event.called_at.as_deref(), event.result_at.as_deref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            times,
+            [
+                (Some("called"), Some("finished")),
+                (Some("pending"), None),
+                (None, None),
             ]
         );
     }
@@ -1090,6 +1144,8 @@ mod tests {
             name: Some("Bash".to_string()),
             command: "pwd".to_string(),
             output: "/repo/demo".to_string(),
+            called_at: None,
+            result_at: None,
         };
 
         recreate_database(&db_path, std::slice::from_ref(&row)).unwrap();

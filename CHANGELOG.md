@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- Store `called_at` and `result_at` for every Bash call in `exec_events`, so
+  timing queries no longer need to join the transcripts.
+- Upgrade the index to schema v2 on the next refresh, filling existing rows and
+  keeping their keys. `--no-refresh` refuses a v1 index until then, and 0.2.x
+  cannot open an upgraded index.
+- Add an optional Claude Code hook for the run time of each Bash call. Each
+  refresh moves its log to `~/.claude/exec-log/exec.sqlite3` after indexing.
+  It is not retroactive: calls made before the hook was installed have no run
+  time.
+
 ## 0.2.1
 
 - Align session metadata columns and place the title last. Long fixed-width

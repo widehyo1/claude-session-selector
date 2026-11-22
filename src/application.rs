@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::{
     cli::{Command, IndexOptions, ReplayOptions, SelectOptions},
+    exec_log,
     indexer::{self, search::SearchIndex, store::SessionView},
     replay,
     selector::{self, SelectorAction, SelectorApp},
@@ -25,8 +26,18 @@ pub(crate) fn run(command: Command) -> Result<()> {
 }
 
 fn run_index(options: IndexOptions) -> Result<()> {
-    let outcome = indexer::build_index(&options)?;
+    refresh_local_data(&options)
+}
+
+// The hook writes its line before Claude Code records the tool result, so reading
+// the log after the transcripts covers every result that was just indexed.
+fn refresh_local_data(options: &IndexOptions) -> Result<()> {
+    let outcome = indexer::build_index(options)?;
     println!("{}", indexer::format_summary(&outcome.summary));
+    // Timings are auxiliary: their failure must not take the selector down.
+    if let Err(error) = exec_log::refresh(&options.sessions_root) {
+        eprintln!("warning: {error:#}");
+    }
     Ok(())
 }
 
@@ -87,9 +98,7 @@ fn refresh_database(options: &SelectOptions) -> Result<()> {
         include_exec: false,
         ..defaults
     };
-    let outcome = indexer::build_index(&index_options)?;
-    println!("{}", indexer::format_summary(&outcome.summary));
-    Ok(())
+    refresh_local_data(&index_options)
 }
 
 fn external_record_args(

@@ -109,7 +109,7 @@ fn index_help_lists_legacy_recorder_options() {
 }
 
 #[test]
-fn index_creates_schema_v1_with_content_fts() {
+fn index_creates_schema_v2_with_content_fts() {
     let fixture = Fixture::new();
     fixture.write_session("normal.jsonl", "증분 인덱스 확인");
     let output = stdout(fixture.index().output().unwrap());
@@ -122,7 +122,7 @@ fn index_creates_schema_v1_with_content_fts() {
     assert_eq!(
         conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        1
+        2
     );
     let session_columns = conn
         .prepare("SELECT name FROM pragma_table_info('sessions')")
@@ -159,6 +159,44 @@ fn index_creates_schema_v1_with_content_fts() {
 }
 
 #[test]
+fn index_stores_exec_timings_outside_the_rebuildable_index() {
+    let fixture = Fixture::new();
+    fixture.write_session("normal.jsonl", "timed");
+    let dir = fixture.root.join("exec-log");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("exec.jsonl"),
+        "{\"v\":1,\"session_id\":\"s\",\"tool_use_id\":\"t\",\"ended_at_ms\":3000,\"duration_ms\":1000,\"outcome\":\"ok\"}\n",
+    )
+    .unwrap();
+    stdout(fixture.index().output().unwrap());
+    stdout(fixture.index().arg("--rebuild").output().unwrap());
+
+    let conn = Connection::open(dir.join("exec.sqlite3")).unwrap();
+    let started = conn
+        .query_row("SELECT started_at_ms FROM exec_timings", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    assert_eq!(started, 2000);
+}
+
+#[test]
+fn exec_timing_failure_does_not_fail_the_index() {
+    let fixture = Fixture::new();
+    fixture.write_session("normal.jsonl", "timed");
+    let dir = fixture.root.join("exec-log");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("exec.sqlite3"), "not a database, only text").unwrap();
+    fs::write(dir.join("exec.jsonl"), "{}\n").unwrap();
+
+    let output = fixture.index().output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to store exec timings"));
+    assert!(fixture.db.exists());
+}
+
+#[test]
 fn selector_no_refresh_rejects_legacy_database_with_action() {
     let fixture = Fixture::new();
     let conn = Connection::open(&fixture.db).unwrap();
@@ -182,7 +220,7 @@ fn selector_no_refresh_rejects_legacy_database_with_action() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains(
-        "search index schema 1 is required; refresh the index or run `select-claude-session index`"
+        "search index schema 2 is required; refresh the index or run `select-claude-session index`"
     ));
 }
 

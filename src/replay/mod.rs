@@ -39,6 +39,16 @@ enum Fullscreen {
     Detail,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Search,
+}
+
+const DETAIL_HEADER_LINES: usize = 3;
+const MATCH_SCROLL_MARGIN: usize = 2;
+const TIMELINE_SUMMARY_CHARS: usize = 113;
+
 #[derive(Debug, Clone)]
 struct Entry {
     kind: EntryKind,
@@ -49,11 +59,20 @@ struct Entry {
 struct ReplayApp {
     all_entries: Vec<Entry>,
     visible_indices: Vec<usize>,
+    // Position of each visible entry in the exec-filtered list, so numbers survive a search.
+    display_numbers: Vec<usize>,
     list_state: ListState,
     detail_scroll: u16,
     timeline_page_height: u16,
     detail_page_height: u16,
+    detail_width: u16,
     detail_max_scroll: u16,
+    mode: Mode,
+    query: String,
+    // Selection to fall back to when a search leaves nothing selected.
+    search_anchor: Option<usize>,
+    // (all_index, match index) of the match `n`/`N` last moved to.
+    detail_match: Option<(usize, usize)>,
     focus: PaneFocus,
     fullscreen: Fullscreen,
     show_help: bool,
@@ -69,7 +88,7 @@ enum ReplayControl {
 
 impl ReplayApp {
     fn new(all_entries: Vec<Entry>, exec_visibility: ExecVisibility) -> Self {
-        let visible_indices = visible_entry_indices(&all_entries, exec_visibility);
+        let (visible_indices, display_numbers) = filter_entries(&all_entries, exec_visibility, &[]);
         let mut list_state = ListState::default();
         if !visible_indices.is_empty() {
             list_state.select(Some(0));
@@ -78,11 +97,17 @@ impl ReplayApp {
         Self {
             all_entries,
             visible_indices,
+            display_numbers,
             list_state,
             detail_scroll: 0,
             timeline_page_height: 1,
             detail_page_height: 1,
+            detail_width: 1,
             detail_max_scroll: 0,
+            mode: Mode::Normal,
+            query: String::new(),
+            search_anchor: None,
+            detail_match: None,
             focus: PaneFocus::Timeline,
             fullscreen: Fullscreen::None,
             show_help: false,
@@ -104,13 +129,16 @@ impl ReplayApp {
     fn selected_entry(&self) -> Option<(usize, &Entry)> {
         let visible_index = self.selected_visible_index()?;
         let all_index = *self.visible_indices.get(visible_index)?;
-        self.all_entries
-            .get(all_index)
-            .map(|entry| (visible_index, entry))
+        let number = *self.display_numbers.get(visible_index)?;
+        self.all_entries.get(all_index).map(|entry| (number, entry))
     }
 
     fn rebuild_visible_indices(&mut self, previous_all_index: Option<usize>) {
-        self.visible_indices = visible_entry_indices(&self.all_entries, self.exec_visibility);
+        (self.visible_indices, self.display_numbers) = filter_entries(
+            &self.all_entries,
+            self.exec_visibility,
+            &query_terms(&self.query),
+        );
 
         if self.visible_indices.is_empty() {
             self.list_state.select(None);
@@ -137,11 +165,74 @@ impl ReplayApp {
     }
 
     fn toggle_exec_visibility(&mut self) {
-        let previous_all_index = self.selected_all_index();
+        let previous_all_index = self.selected_all_index().or(self.search_anchor);
         self.exec_visibility.toggle();
         self.rebuild_visible_indices(previous_all_index);
         self.detail_scroll = 0;
+        self.detail_match = None;
         self.status = None;
+    }
+
+    fn start_search(&mut self) {
+        self.search_anchor = self.selected_all_index().or(self.search_anchor);
+        self.mode = Mode::Search;
+        self.status = None;
+    }
+
+    // Keeps the selected entry when it still matches; the detail scroll follows the entry.
+    fn refresh_filter(&mut self) {
+        let before = self.selected_all_index();
+        self.rebuild_visible_indices(before.or(self.search_anchor));
+        if self.selected_all_index() != before {
+            self.detail_scroll = 0;
+        }
+        self.detail_match = None;
+        self.status = None;
+    }
+
+    fn clear_filter(&mut self) {
+        self.query.clear();
+        self.mode = Mode::Normal;
+        self.refresh_filter();
+    }
+
+    fn jump_to_match(&mut self, forward: bool) {
+        let terms = query_terms(&self.query);
+        if terms.is_empty() {
+            self.status = Some("no active search".to_string());
+            return;
+        }
+        let Some(all_index) = self.selected_all_index() else {
+            return;
+        };
+        let Some((number, entry)) = self.selected_entry() else {
+            return;
+        };
+
+        let match_lines = detail_match_lines(entry, &terms);
+        let count = match_lines.len();
+        if count == 0 {
+            self.status = Some("no match in this entry".to_string());
+            return;
+        }
+
+        let current = self
+            .detail_match
+            .filter(|(entry_index, _)| *entry_index == all_index)
+            .map(|(_, match_index)| match_index);
+        let target = match (current, forward) {
+            (Some(index), true) => (index + 1) % count,
+            (Some(index), false) => (index + count - 1) % count,
+            (None, true) => 0,
+            (None, false) => count - 1,
+        };
+        let row = detail_row_of_line(entry, number, match_lines[target], self.detail_width);
+
+        self.detail_scroll = row
+            .saturating_sub(MATCH_SCROLL_MARGIN)
+            .min(usize::from(self.detail_max_scroll)) as u16;
+        self.detail_match = Some((all_index, target));
+        self.status = Some(format!("match {}/{count}", target + 1));
     }
 
     fn next(&mut self) {
@@ -275,15 +366,45 @@ impl ReplayApp {
             return ReplayControl::Continue;
         }
 
+        if self.mode == Mode::Search {
+            match key.code {
+                KeyCode::Esc => self.clear_filter(),
+                KeyCode::Enter => self.mode = Mode::Normal,
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.refresh_filter();
+                }
+                KeyCode::Char(ch) => {
+                    self.query.push(ch);
+                    self.refresh_filter();
+                }
+                _ => {}
+            }
+            return ReplayControl::Continue;
+        }
+
         match key.code {
             KeyCode::Char('q') => ReplayControl::Quit,
             KeyCode::Esc => {
                 if self.fullscreen != Fullscreen::None {
                     self.exit_fullscreen();
                     ReplayControl::Continue
+                } else if !self.query.is_empty() {
+                    self.clear_filter();
+                    ReplayControl::Continue
                 } else {
                     ReplayControl::Quit
                 }
+            }
+            KeyCode::Char('/') => {
+                self.start_search();
+                ReplayControl::Continue
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if self.focus == PaneFocus::Detail {
+                    self.jump_to_match(key.code == KeyCode::Char('n'));
+                }
+                ReplayControl::Continue
             }
             KeyCode::Char('e') if key.modifiers.is_empty() => {
                 self.toggle_exec_visibility();
@@ -491,6 +612,105 @@ fn visible_entry_indices(entries: &[Entry], visibility: ExecVisibility) -> Vec<u
         .collect()
 }
 
+fn query_terms(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+fn entry_matches(entry: &Entry, terms: &[String]) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let summary = entry.summary.to_lowercase();
+    let detail = entry.detail.to_lowercase();
+    terms
+        .iter()
+        .all(|term| summary.contains(term.as_str()) || detail.contains(term.as_str()))
+}
+
+// Returns the visible entries and, for each, its number in the exec-filtered list.
+fn filter_entries(
+    entries: &[Entry],
+    visibility: ExecVisibility,
+    terms: &[String],
+) -> (Vec<usize>, Vec<usize>) {
+    visible_entry_indices(entries, visibility)
+        .into_iter()
+        .enumerate()
+        .filter(|(_, all_index)| entry_matches(&entries[*all_index], terms))
+        .map(|(number, all_index)| (all_index, number))
+        .unzip()
+}
+
+// Byte ranges of the terms in `text`. Only ASCII case is folded so offsets stay valid.
+fn match_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let haystack = text.to_ascii_lowercase();
+    let mut ranges: Vec<(usize, usize)> = terms
+        .iter()
+        .flat_map(|term| {
+            haystack
+                .match_indices(term.as_str())
+                .map(|(start, matched)| (start, start + matched.len()))
+        })
+        .collect();
+    ranges.sort_unstable();
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+fn highlight_spans(
+    text: &str,
+    ranges: &[(usize, usize)],
+    style_of: impl Fn(usize) -> Style,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+
+    for (index, &(start, end)) in ranges.iter().enumerate() {
+        if start > cursor {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+        spans.push(Span::styled(text[start..end].to_string(), style_of(index)));
+        cursor = end;
+    }
+    if cursor < text.len() || spans.is_empty() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+
+    spans
+}
+
+// Detail line index of every match, in the order `detail_text` numbers them.
+fn detail_match_lines(entry: &Entry, terms: &[String]) -> Vec<usize> {
+    entry
+        .detail
+        .lines()
+        .enumerate()
+        .flat_map(|(line_index, line)| {
+            std::iter::repeat_n(line_index, match_ranges(line, terms).len())
+        })
+        .collect()
+}
+
+// Wrapped rows above the given detail line.
+fn detail_row_of_line(entry: &Entry, number: usize, line_index: usize, width: u16) -> usize {
+    let mut text = detail_text(entry, number, &[], None);
+    text.lines.truncate(DETAIL_HEADER_LINES + line_index);
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1))
+}
+
 fn parse_json_values(input: &str) -> Result<Vec<Value>> {
     if input.starts_with('[') {
         let values: Vec<Value> = serde_json::from_str(input).context("invalid json array input")?;
@@ -611,6 +831,11 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         .selected_visible_index()
         .map(|i| format!("{}/{}", i + 1, app.visible_indices.len()))
         .unwrap_or_else(|| "0/0".to_string());
+    let query = if app.query.is_empty() {
+        String::new()
+    } else {
+        format!(" | /{}", app.query)
+    };
 
     let header = Line::from(vec![
         Span::styled(
@@ -619,7 +844,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         ),
         Span::styled(selected, Style::default().fg(Color::Cyan)),
         Span::raw(format!(
-            " of {} | exec: {}",
+            " of {}{query} | exec: {}",
             app.all_entries.len(),
             app.exec_visibility.label()
         )),
@@ -631,11 +856,16 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
 fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
     app.timeline_page_height = pane_content_area(area).height.max(1);
 
+    let terms = query_terms(&app.query);
+    let match_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::UNDERLINED);
+
     let items: Vec<ListItem> = app
         .visible_indices
         .iter()
-        .enumerate()
-        .filter_map(|(visible_index, all_index)| {
+        .zip(&app.display_numbers)
+        .filter_map(|(all_index, number)| {
             let entry = app.all_entries.get(*all_index)?;
             let style = match entry.kind {
                 EntryKind::User => Style::default().fg(Color::Green),
@@ -643,11 +873,18 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
                 EntryKind::Exec => Style::default().fg(Color::Yellow),
             };
 
-            Some(ListItem::new(Line::from(vec![
+            let summary = truncate(&entry.summary, TIMELINE_SUMMARY_CHARS);
+            let mut spans = vec![
                 Span::styled(kind_label(&entry.kind), style.add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::raw(truncate(&display_title(visible_index, entry), 120)),
-            ])))
+                Span::raw(format!(" #{number:04} ")),
+            ];
+            spans.extend(highlight_spans(
+                &summary,
+                &match_ranges(&summary, &terms),
+                |_| match_style,
+            ));
+
+            Some(ListItem::new(Line::from(spans)))
         })
         .collect();
 
@@ -659,11 +896,15 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
         Style::default()
     };
 
-    let title = if focused {
-        " Timeline [focus] "
-    } else {
-        " Timeline "
-    };
+    let title = format!(
+        " Timeline{}{} ",
+        if focused { " [focus]" } else { "" },
+        if app.mode == Mode::Search {
+            " [search]"
+        } else {
+            ""
+        }
+    );
 
     let list = List::new(items)
         .block(
@@ -686,20 +927,36 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Repla
     let content_area = pane_content_area(area);
     app.detail_page_height = content_area.height.max(1);
 
-    let Some((visible_index, entry)) = app
+    app.detail_width = content_area.width.max(1);
+
+    let Some((number, entry)) = app
         .selected_entry()
-        .map(|(visible_index, entry)| (visible_index, entry.clone()))
+        .map(|(number, entry)| (number, entry.clone()))
     else {
         app.detail_max_scroll = 0;
         app.detail_scroll = 0;
-        let empty = Paragraph::new("No entries")
-            .block(Block::new().title(" Detail ").borders(Borders::ALL));
+        let message = if app.query.is_empty() {
+            "No entries"
+        } else {
+            "No matches"
+        };
+        let empty =
+            Paragraph::new(message).block(Block::new().title(" Detail ").borders(Borders::ALL));
         frame.render_widget(empty, area);
         return;
     };
 
+    let selected_all_index = app.selected_all_index();
+    let current_match = app
+        .detail_match
+        .filter(|(entry_index, _)| Some(*entry_index) == selected_all_index)
+        .map(|(_, match_index)| match_index);
+    let text = detail_text(&entry, number, &query_terms(&app.query), current_match);
+
     app.detail_max_scroll = bottom_scroll_offset(
-        detail_line_count(&entry, visible_index, content_area.width),
+        Paragraph::new(text.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(content_area.width),
         content_area.height,
     );
     app.detail_scroll = app.detail_scroll.min(app.detail_max_scroll);
@@ -721,9 +978,8 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Repla
 
     let title = format!(
         " Detail{focus_suffix}{fullscreen_suffix}: {} ",
-        display_title(visible_index, &entry)
+        display_title(number, &entry)
     );
-    let text = detail_text(&entry, visible_index);
 
     let paragraph = Paragraph::new(text)
         .block(
@@ -738,14 +994,20 @@ fn render_detail(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut Repla
     frame.render_widget(paragraph, area);
 }
 
-fn detail_line_count(entry: &Entry, visible_index: usize, width: u16) -> usize {
-    Paragraph::new(detail_text(entry, visible_index))
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-}
-
-fn detail_text(entry: &Entry, visible_index: usize) -> Text<'static> {
+// `current` is the match index, counted across the whole detail, that `n`/`N` points at.
+fn detail_text(
+    entry: &Entry,
+    visible_index: usize,
+    terms: &[String],
+    current: Option<usize>,
+) -> Text<'static> {
+    let match_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let current_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightMagenta)
+        .add_modifier(Modifier::BOLD);
     let mut lines = Vec::new();
+    let mut match_count = 0;
 
     lines.push(Line::from(vec![
         Span::styled("index: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -760,7 +1022,15 @@ fn detail_text(entry: &Entry, visible_index: usize) -> Text<'static> {
     lines.push(Line::raw(""));
 
     for line in entry.detail.lines() {
-        lines.push(Line::raw(line.to_string()));
+        let ranges = match_ranges(line, terms);
+        lines.push(Line::from(highlight_spans(line, &ranges, |index| {
+            if current == Some(match_count + index) {
+                current_style
+            } else {
+                match_style
+            }
+        })));
+        match_count += ranges.len();
     }
 
     Text::from(lines)
@@ -792,9 +1062,21 @@ fn render_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
         .map(|s| format!(" | {s}"))
         .unwrap_or_default();
 
+    if app.mode == Mode::Search {
+        let footer = Line::from(vec![
+            Span::raw(" search: "),
+            Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw("  | Enter keep filter  Esc clear filter "),
+        ])
+        .gray();
+        frame.render_widget(footer, area);
+        return;
+    }
+
     let footer = Line::from(vec![
         Span::raw(format!(" focus: {focus}{fullscreen}{status} ")),
-        Span::raw(" | Tab focus "),
+        Span::raw(" | / search "),
+        Span::raw(" Tab focus "),
         Span::raw(" 1/2 fullscreen "),
         Span::raw(" f fullscreen-focus "),
         Span::raw(" e exec "),
@@ -835,12 +1117,18 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  g / Home        scroll detail to top"),
         Line::raw("  G / End         scroll detail to bottom with the last line visible"),
         Line::raw("  y               copy selected detail to clipboard"),
+        Line::raw("  n / N           scroll to the next/previous search match"),
+        Line::raw(""),
+        Line::raw("Search"),
+        Line::raw("  /               filter the timeline to entries matching every word"),
+        Line::raw("  Enter           keep the filter and leave search input"),
+        Line::raw("  Esc             clear the filter, keeping the selected entry"),
         Line::raw(""),
         Line::raw("Fullscreen"),
         Line::raw("  1               toggle timeline fullscreen"),
         Line::raw("  2               toggle detail fullscreen"),
         Line::raw("  f               toggle focused pane fullscreen"),
-        Line::raw("  Esc             leave fullscreen/help or quit"),
+        Line::raw("  Esc             leave fullscreen/help, clear the filter, or quit"),
         Line::raw(""),
         Line::raw("Other"),
         Line::raw("  e               toggle command execution entries"),
@@ -1115,11 +1403,11 @@ mod tests {
         );
 
         assert_eq!(
-            detail_text(&hidden.all_entries[2], 1).lines[0].spans[1].content,
+            detail_text(&hidden.all_entries[2], 1, &[], None).lines[0].spans[1].content,
             "1"
         );
         assert_eq!(
-            detail_text(&shown.all_entries[2], 2).lines[0].spans[1].content,
+            detail_text(&shown.all_entries[2], 2, &[], None).lines[0].spans[1].content,
             "2"
         );
     }
@@ -1239,6 +1527,225 @@ mod tests {
 
         assert_eq!(app.exec_visibility, ExecVisibility::Hidden);
         assert_eq!(app.visible_indices.len(), 5_000);
+    }
+
+    fn type_query(app: &mut ReplayApp, query: &str) {
+        app.handle_key(key(KeyCode::Char('/')));
+        for ch in query.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    fn terms(query: &str) -> Vec<String> {
+        query_terms(query)
+    }
+
+    #[test]
+    fn search_filters_timeline_and_keeps_entry_numbers() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        type_query(&mut app, "GIT status");
+        assert_eq!(app.mode, Mode::Search);
+        assert_eq!(app.visible_indices, vec![3]);
+        assert_eq!(app.display_numbers, vec![3]);
+        assert_eq!(
+            app.selected_detail_string().unwrap().lines().next(),
+            Some("#0003 EXEC git status")
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.visible_indices, vec![3]);
+    }
+
+    #[test]
+    fn search_input_takes_normal_mode_keys_as_text() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for ch in ['q', 'e', 'n'] {
+            assert_eq!(
+                app.handle_key(key(KeyCode::Char(ch))),
+                ReplayControl::Continue
+            );
+        }
+        assert_eq!(app.query, "qen");
+        assert_eq!(app.exec_visibility, ExecVisibility::Shown);
+
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.query, "qe");
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            ReplayControl::Quit
+        );
+    }
+
+    #[test]
+    fn search_respects_exec_visibility() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Hidden);
+
+        type_query(&mut app, "git");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.visible_indices.is_empty());
+
+        app.handle_key(key(KeyCode::Char('e')));
+        assert_eq!(app.visible_indices, vec![3]);
+        assert_eq!(app.display_numbers, vec![3]);
+    }
+
+    #[test]
+    fn esc_clears_filter_and_keeps_the_selected_entry() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        type_query(&mut app, "done");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.visible_indices, vec![2]);
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), ReplayControl::Continue);
+        assert!(app.query.is_empty());
+        assert_eq!(app.visible_indices, vec![0, 1, 2, 3]);
+        assert_eq!(app.selected_all_index(), Some(2));
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), ReplayControl::Quit);
+    }
+
+    #[test]
+    fn esc_in_fullscreen_leaves_fullscreen_before_clearing_filter() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        type_query(&mut app, "done");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('2')));
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.fullscreen, Fullscreen::None);
+        assert_eq!(app.query, "done");
+    }
+
+    #[test]
+    fn clearing_an_empty_result_restores_the_previous_selection() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+        app.list_state.select(Some(2));
+
+        type_query(&mut app, "zzz");
+        assert!(app.visible_indices.is_empty());
+        assert_eq!(app.selected_all_index(), None);
+        render_at(&mut app, 100, 18);
+
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.selected_all_index(), Some(2));
+    }
+
+    #[test]
+    fn match_ranges_fold_ascii_case_and_keep_byte_offsets() {
+        assert_eq!(
+            match_ranges("한글 Docker docker", &terms("DOCKER")),
+            vec![(7, 13), (14, 20)]
+        );
+        assert_eq!(match_ranges("abcabc", &terms("abc bca")), vec![(0, 6)]);
+        assert_eq!(match_ranges("한글 검색", &terms("검색")), vec![(7, 13)]);
+        assert!(match_ranges("anything", &[]).is_empty());
+    }
+
+    #[test]
+    fn detail_text_highlights_matches_and_marks_the_current_one() {
+        let entry = Entry {
+            kind: EntryKind::User,
+            summary: "USER".to_string(),
+            detail: "plain\nfix Docker and docker".to_string(),
+        };
+
+        let text = detail_text(&entry, 0, &terms("docker"), Some(1));
+        assert_eq!(text.lines[3].spans.len(), 1);
+
+        let spans = &text.lines[4].spans;
+        let contents: Vec<&str> = spans.iter().map(|span| span.content.as_ref()).collect();
+        assert_eq!(contents, vec!["fix ", "Docker", " and ", "docker"]);
+        assert_eq!(spans[1].style.bg, Some(Color::Yellow));
+        assert_eq!(spans[3].style.bg, Some(Color::LightMagenta));
+        assert_eq!(spans[0].style, Style::default());
+
+        let plain = detail_text(&entry, 0, &[], None);
+        assert_eq!(plain.lines[4].spans.len(), 1);
+    }
+
+    #[test]
+    fn n_and_shift_n_scroll_the_detail_between_matches() {
+        let entry = Entry {
+            kind: EntryKind::User,
+            summary: "USER".to_string(),
+            detail: (1..=30)
+                .map(|line| {
+                    if line == 10 || line == 25 {
+                        format!("line {line:02} needle")
+                    } else {
+                        format!("line {line:02}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let mut app = ReplayApp::new(vec![entry], ExecVisibility::Hidden);
+        type_query(&mut app, "needle");
+        app.handle_key(key(KeyCode::Enter));
+        render_at(&mut app, 100, 18);
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.detail_match, None, "timeline focus must not jump");
+
+        app.focus = PaneFocus::Detail;
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.detail_match, Some((0, 0)));
+        assert_eq!(app.detail_scroll, 10);
+        assert_eq!(app.status.as_deref(), Some("match 1/2"));
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.detail_match, Some((0, 1)));
+        assert_eq!(app.detail_scroll, 19);
+
+        app.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(app.detail_match, Some((0, 0)));
+
+        app.handle_key(key(KeyCode::Char('N')));
+        assert_eq!(app.detail_match, Some((0, 1)));
+        assert_eq!(app.status.as_deref(), Some("match 2/2"));
+    }
+
+    #[test]
+    fn match_jump_counts_wrapped_rows() {
+        let entry = Entry {
+            kind: EntryKind::User,
+            summary: "USER".to_string(),
+            detail: format!("{}\nneedle", "word ".repeat(60)),
+        };
+
+        assert_eq!(detail_match_lines(&entry, &terms("needle")), vec![1]);
+        assert_eq!(detail_row_of_line(&entry, 0, 1, 100), 3 + 3);
+    }
+
+    #[test]
+    fn search_renders_filter_state() {
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+        type_query(&mut app, "git");
+
+        let backend = TestBackend::new(120, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = format!("{}", terminal.backend());
+
+        assert!(screen.contains("| /git"));
+        assert!(screen.contains("Timeline [focus] [search]"));
+        assert!(screen.contains("#0003 EXEC git status"));
+        assert!(!screen.contains("#0001 EXEC pwd"));
+        assert!(screen.contains("search: git"));
     }
 
     #[test]

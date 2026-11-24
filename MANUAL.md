@@ -306,7 +306,16 @@ shown.
 | `f` | Toggle the focused pane fullscreen. |
 | `e` | Toggle Bash command entries. |
 | `y` | Copy detail text when the detail pane is focused. |
+| `/` | Filter the timeline while typing. |
+| `n` / `N` | Scroll the focused detail pane to the next or previous match. |
 | `?`, `q`, Ctrl-C, Esc | Help and exit controls. |
+
+`/` keeps the entries whose summary or detail contains every word of the
+query, ignoring case, and highlights the matches. It filters within the
+current Bash visibility, and entry numbers stay the same as without the
+filter. `Enter` keeps the filter. `Esc` clears it and stays on the selected
+entry; outside search input, `Esc` leaves fullscreen first and quits only when
+no filter is set.
 
 ## Migration and SQLite contract
 

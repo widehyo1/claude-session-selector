@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Add `/` search to replay. It filters the timeline to the entries that
+  contain every word of the query and highlights the matches; `n` / `N` scroll
+  the detail pane between matches. `Esc` clears the filter and keeps the
+  selected entry, so `Esc` now quits replay only when no filter is set.
+
 ## 0.3.0
 
 - Store `called_at` and `result_at` for every Bash call in `exec_events`, so

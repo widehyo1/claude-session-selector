@@ -262,9 +262,11 @@ impl SearchIndex {
                  s.path, s.id, s.timestamp, s.cwd, s.repository_url, s.branch,
                  s.first_message, s.is_subsession, s.title, s.parent_session_id,
                  s.parent_tool_use_id, s.agent_type, s.continued_in_session_id,
+                 strftime('%Y-%m-%d %H:%M', f.modified_secs, 'unixepoch'),
                  sessions_fts.rank
              FROM sessions_fts
              JOIN sessions AS s ON s.session_key = sessions_fts.rowid
+             JOIN source_files AS f ON f.source_key = s.source_key
              WHERE sessions_fts MATCH ?1
                AND sessions_fts.rank MATCH
                    'bm25(4.0, 4.0, 1.5, 0.25)'
@@ -290,13 +292,15 @@ impl SearchIndex {
 
     fn query_unranked(&self) -> Result<Vec<SearchHit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, id, timestamp, cwd, repository_url, branch,
-                    first_message, is_subsession, title, parent_session_id,
-                    parent_tool_use_id, agent_type, continued_in_session_id
-             FROM sessions
-             WHERE (?1 = 1 OR is_subsession = 0)
-               AND (?2 = 1 OR has_nonempty_first_message = 1)
-             ORDER BY timestamp DESC, session_key DESC",
+            "SELECT s.path, s.id, s.timestamp, s.cwd, s.repository_url, s.branch,
+                    s.first_message, s.is_subsession, s.title, s.parent_session_id,
+                    s.parent_tool_use_id, s.agent_type, s.continued_in_session_id,
+                    strftime('%Y-%m-%d %H:%M', f.modified_secs, 'unixepoch')
+             FROM sessions AS s
+             JOIN source_files AS f ON f.source_key = s.source_key
+             WHERE (?1 = 1 OR s.is_subsession = 0)
+               AND (?2 = 1 OR s.has_nonempty_first_message = 1)
+             ORDER BY s.timestamp DESC, s.session_key DESC",
         )?;
         let rows = stmt.query_map(
             params![
@@ -305,7 +309,7 @@ impl SearchIndex {
             ],
             |row| {
                 Ok(SearchHit {
-                    row: store::session_row(row)?,
+                    row: session_row_with_modified(row)?,
                     rank: 0.0,
                 })
             },
@@ -316,8 +320,16 @@ impl SearchIndex {
 
 fn map_ranked_hit(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchHit> {
     Ok(SearchHit {
-        row: store::session_row(row)?,
-        rank: row.get(store::SESSION_ROW_COLUMNS)?,
+        row: session_row_with_modified(row)?,
+        rank: row.get(store::SESSION_ROW_COLUMNS + 1)?,
+    })
+}
+
+// The session columns followed by the formatted modification time of its source file.
+fn session_row_with_modified(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+    Ok(SessionRow {
+        file_modified_at: row.get(store::SESSION_ROW_COLUMNS)?,
+        ..store::session_row(row)?
     })
 }
 

@@ -68,6 +68,7 @@ fn session_row_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Se
         parent_tool_use_id: row.get(offset + 10)?,
         agent_type: row.get(offset + 11)?,
         continued_in_session_id: row.get(offset + 12)?,
+        file_modified_at: None,
     })
 }
 

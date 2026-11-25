@@ -5,6 +5,10 @@
 - Add a `YYYY-mm-dd HH:mm` time column at the end of each replay timeline row,
   taken from the record's transcript timestamp (UTC). The summary narrows so
   the time stays visible; entries without a timestamp show `-`.
+- Add a `file modified` column right after the date in the session list, and
+  to the `i` details: when the transcript file was last written, as
+  `YYYY-mm-dd HH:mm` UTC. It comes from the index's file fingerprint, so the
+  schema is unchanged; it approximates the last activity, not the last prompt.
 
 ## 0.3.1
 

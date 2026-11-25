@@ -798,8 +798,9 @@ fn render_help(frame: &mut Frame) {
 
 fn details_text(row: &SessionRow) -> String {
     format!(
-        "Date: {}\n\nTitle: {}\n\nWorking directory: {}\n\nBranch: {}\n\nRepository: {}",
+        "Date: {}\n\nFile modified (UTC): {}\n\nTitle: {}\n\nWorking directory: {}\n\nBranch: {}\n\nRepository: {}",
         dash_empty(&session_date(row)),
+        dash_empty(row.file_modified_at.as_deref().unwrap_or_default()),
         dash_empty(row.title.as_deref().unwrap_or_default()),
         dash_empty(row.cwd.as_deref().unwrap_or_default()),
         dash_empty(row.branch.as_deref().unwrap_or_default()),
@@ -856,6 +857,11 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
     segments.extend([
         (
             fixed_column(&session_date(row), 10),
+            Style::default().fg(Color::Cyan),
+        ),
+        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
+        (
+            fixed_column(row.file_modified_at.as_deref().unwrap_or_default(), 16),
             Style::default().fg(Color::Cyan),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
@@ -1081,6 +1087,35 @@ mod tests {
     }
 
     #[test]
+    fn file_modified_time_follows_the_date_column() {
+        let (_fixture, app) = sample_app(ExecVisibility::Hidden);
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for row in &app.filtered {
+            let modified = std::fs::metadata(&row.path)
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let expected: String = conn
+                .query_row(
+                    "SELECT strftime('%Y-%m-%d %H:%M', ?1, 'unixepoch')",
+                    [modified],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(row.file_modified_at.as_deref(), Some(expected.as_str()));
+            let line = metadata_plain(row, false);
+            assert!(
+                line.starts_with(&format!(" {} | {expected} | ", session_date(row))),
+                "{line}"
+            );
+            assert!(details_text(row).contains(&format!("File modified (UTC): {expected}")));
+        }
+    }
+
+    #[test]
     fn selector_app_shows_badges_only_for_an_include_subsessions_view() {
         let fixture = SessionFixture::new();
         fixture.write_named_session("main.jsonl", "main task", false);
@@ -1141,7 +1176,7 @@ mod tests {
     #[test]
     fn scrolled_segments_preserve_text_after_horizontal_offset() {
         let rows = sample_rows();
-        let line = scrolled_segments(&metadata_segments(&rows[1], false), 14);
+        let line = scrolled_segments(&metadata_segments(&rows[1], false), 14 + 19);
         let text = line
             .spans
             .into_iter()

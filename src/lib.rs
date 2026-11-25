@@ -58,6 +58,9 @@ pub struct SessionRow {
     pub parent_tool_use_id: Option<String>,
     pub agent_type: Option<String>,
     pub continued_in_session_id: Option<String>,
+    // When the transcript file was last written, `YYYY-mm-dd HH:mm` UTC. Only the
+    // selector's index queries fill it; it approximates the last activity, not the last prompt.
+    pub file_modified_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +343,7 @@ pub(crate) fn parse_session_file_data(
         } else {
             meta.continued_in
         },
+        file_modified_at: None,
     };
     for event in &mut exec_events {
         event.session_id = row.id.clone();

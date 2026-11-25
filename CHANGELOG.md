@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.2
 
 - Add a `YYYY-mm-dd HH:mm` time column at the end of each replay timeline row,
   taken from the record's transcript timestamp (UTC). The summary narrows so

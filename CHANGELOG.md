@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - Add `/` search to replay. It filters the timeline to the entries that
   contain every word of the query and highlights the matches; `n` / `N` scroll

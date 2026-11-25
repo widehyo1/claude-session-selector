@@ -15,7 +15,7 @@ use crate::{
     cli::ReplayOptions,
     session_event::{self, MessageRole},
     terminal,
-    ui::{bottom_scroll_offset, half_page_height, pane_content_area},
+    ui::{bottom_scroll_offset, fit_width, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
 };
 
@@ -48,12 +48,17 @@ enum Mode {
 const DETAIL_HEADER_LINES: usize = 3;
 const MATCH_SCROLL_MARGIN: usize = 2;
 const TIMELINE_SUMMARY_CHARS: usize = 113;
+// Highlight symbol, kind label, and " #0000 " come before the summary.
+const TIMELINE_PREFIX_WIDTH: usize = 2 + 5 + 7;
+const TIMELINE_TIME_WIDTH: usize = "YYYY-mm-dd HH:mm".len();
 
 #[derive(Debug, Clone)]
 struct Entry {
     kind: EntryKind,
     summary: String,
     detail: String,
+    // The record timestamp as `YYYY-mm-dd HH:mm`, as written in the transcript (UTC).
+    time: Option<String>,
 }
 
 struct ReplayApp {
@@ -584,12 +589,19 @@ fn load_entries(values: Vec<Value>) -> Vec<Entry> {
     let mut exec_by_call_id: HashMap<String, usize> = HashMap::new();
 
     for value in values {
+        let time = record_time(&value);
         if let Some(message) = session_event::normalize_message_record(&value) {
-            entries.push(message_entry(message.role, message.content));
+            entries.push(Entry {
+                time: time.clone(),
+                ..message_entry(message.role, message.content)
+            });
         }
         for call in session_event::bash_calls(&value) {
             exec_by_call_id.insert(call.call_id.clone(), entries.len());
-            entries.push(bash_entry(&call.call_id, &call.command));
+            entries.push(Entry {
+                time: time.clone(),
+                ..bash_entry(&call.call_id, &call.command)
+            });
         }
         for output in session_event::tool_outputs(&value) {
             if let Some(&index) = exec_by_call_id.get(&output.call_id) {
@@ -599,6 +611,13 @@ fn load_entries(values: Vec<Value>) -> Vec<Entry> {
     }
 
     entries
+}
+
+// `2026-11-01T09:05:30.000Z` -> `2026-11-01 09:05`; anything else is not shown.
+fn record_time(value: &Value) -> Option<String> {
+    let timestamp = value.get("timestamp")?.as_str()?;
+    let (date, time) = timestamp.get(..16)?.split_once('T')?;
+    (date.len() == 10 && time.len() == 5).then(|| format!("{date} {time}"))
 }
 
 fn visible_entry_indices(entries: &[Entry], visibility: ExecVisibility) -> Vec<usize> {
@@ -737,6 +756,7 @@ fn message_entry(role: MessageRole, content: String) -> Entry {
         kind,
         summary: summary.to_string(),
         detail: content,
+        time: None,
     }
 }
 
@@ -760,6 +780,7 @@ fn bash_entry(call_id: &str, command: &str) -> Entry {
         kind: EntryKind::Exec,
         summary: format!("EXEC {command_summary}"),
         detail,
+        time: None,
     }
 }
 
@@ -854,7 +875,12 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &ReplayApp
 }
 
 fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayApp) {
+    let content_width = usize::from(pane_content_area(area).width);
     app.timeline_page_height = pane_content_area(area).height.max(1);
+    // The time column stays at the end of the row; the summary gives way on narrow panes.
+    let summary_width = content_width
+        .saturating_sub(TIMELINE_PREFIX_WIDTH + 1 + TIMELINE_TIME_WIDTH)
+        .min(TIMELINE_SUMMARY_CHARS + 1);
 
     let terms = query_terms(&app.query);
     let match_style = Style::default()
@@ -873,7 +899,10 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
                 EntryKind::Exec => Style::default().fg(Color::Yellow),
             };
 
-            let summary = truncate(&entry.summary, TIMELINE_SUMMARY_CHARS);
+            let summary = fit_width(
+                &truncate(&entry.summary, TIMELINE_SUMMARY_CHARS),
+                summary_width,
+            );
             let mut spans = vec![
                 Span::styled(kind_label(&entry.kind), style.add_modifier(Modifier::BOLD)),
                 Span::raw(format!(" #{number:04} ")),
@@ -882,6 +911,10 @@ fn render_list(frame: &mut Frame, area: ratatui::layout::Rect, app: &mut ReplayA
                 &summary,
                 &match_ranges(&summary, &terms),
                 |_| match_style,
+            ));
+            spans.push(Span::styled(
+                format!(" {}", entry.time.as_deref().unwrap_or("-")),
+                Style::default().fg(Color::DarkGray),
             ));
 
             Some(ListItem::new(Line::from(spans)))
@@ -1329,11 +1362,13 @@ mod tests {
 
         let entries = vec![
             Entry {
+                time: None,
                 kind: EntryKind::User,
                 summary: "USER".to_string(),
                 detail: "hello".to_string(),
             },
             Entry {
+                time: None,
                 kind: EntryKind::Exec,
                 summary: "EXEC pwd".to_string(),
                 detail: "/tmp".to_string(),
@@ -1349,6 +1384,7 @@ mod tests {
     #[test]
     fn only_exec_entries_transition_through_empty_selection() {
         let entries = vec![Entry {
+            time: None,
             kind: EntryKind::Exec,
             summary: "EXEC pwd".to_string(),
             detail: "/tmp".to_string(),
@@ -1415,6 +1451,7 @@ mod tests {
     #[test]
     fn detail_half_page_and_end_follow_the_rendered_pane_height() {
         let entry = Entry {
+            time: None,
             kind: EntryKind::User,
             summary: "USER".to_string(),
             detail: (1..=30)
@@ -1436,6 +1473,7 @@ mod tests {
     #[test]
     fn fullscreen_detail_syncs_focus_for_detail_navigation() {
         let entry = Entry {
+            time: None,
             kind: EntryKind::User,
             summary: "USER".to_string(),
             detail: (1..=30)
@@ -1459,6 +1497,7 @@ mod tests {
     fn timeline_half_page_follows_the_rendered_pane_height() {
         let entries = (0..20)
             .map(|index| Entry {
+                time: None,
                 kind: EntryKind::User,
                 summary: format!("USER {index}"),
                 detail: String::new(),
@@ -1509,6 +1548,7 @@ mod tests {
     fn repeated_toggle_reuses_all_entries() {
         let entries = (0..10_000)
             .map(|index| Entry {
+                time: None,
                 kind: if index % 2 == 0 {
                     EntryKind::User
                 } else {
@@ -1657,6 +1697,7 @@ mod tests {
     #[test]
     fn detail_text_highlights_matches_and_marks_the_current_one() {
         let entry = Entry {
+            time: None,
             kind: EntryKind::User,
             summary: "USER".to_string(),
             detail: "plain\nfix Docker and docker".to_string(),
@@ -1679,6 +1720,7 @@ mod tests {
     #[test]
     fn n_and_shift_n_scroll_the_detail_between_matches() {
         let entry = Entry {
+            time: None,
             kind: EntryKind::User,
             summary: "USER".to_string(),
             detail: (1..=30)
@@ -1721,6 +1763,7 @@ mod tests {
     #[test]
     fn match_jump_counts_wrapped_rows() {
         let entry = Entry {
+            time: None,
             kind: EntryKind::User,
             summary: "USER".to_string(),
             detail: format!("{}\nneedle", "word ".repeat(60)),
@@ -1728,6 +1771,34 @@ mod tests {
 
         assert_eq!(detail_match_lines(&entry, &terms("needle")), vec![1]);
         assert_eq!(detail_row_of_line(&entry, 0, 1, 100), 3 + 3);
+    }
+
+    #[test]
+    fn timeline_rows_end_with_record_time() {
+        let entries = load_entries_from_str(MAIN).unwrap();
+        let times: Vec<_> = entries.iter().map(|entry| entry.time.clone()).collect();
+        assert!(times.iter().all(Option::is_some), "{times:?}");
+        let mut app = ReplayApp::new(entries, ExecVisibility::Shown);
+
+        for width in [200, 100] {
+            let backend = TestBackend::new(width, 18);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| render(frame, &mut app)).unwrap();
+            let screen = format!("{}", terminal.backend());
+            let row = screen
+                .lines()
+                .find(|line| line.contains("#0003"))
+                .expect("exec row is rendered");
+            let time = times[3].as_deref().unwrap();
+            assert!(row.contains(&format!(" {time}")), "{row}");
+        }
+
+        let entries = load_entries_from_str(common_fixture()).unwrap();
+        assert_eq!(entries[0].time, None);
+        assert_eq!(
+            record_time(&serde_json::json!({"timestamp": "2026-11-01T09:05:30.000Z"})).as_deref(),
+            Some("2026-11-01 09:05")
+        );
     }
 
     #[test]

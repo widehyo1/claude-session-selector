@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add a `YYYY-mm-dd HH:mm` time column at the end of each replay timeline row,
+  taken from the record's transcript timestamp (UTC). The summary narrows so
+  the time stays visible; entries without a timestamp show `-`.
+
 ## 0.3.1
 
 - Add `/` search to replay. It filters the timeline to the entries that

@@ -14,7 +14,7 @@ use crate::{
     SessionRow, filter_sessions,
     indexer::search::{ContentScope, QueryError, SearchIndex, is_corruption},
     session_date, terminal,
-    ui::{bottom_scroll_offset, half_page_height, pane_content_area},
+    ui::{bottom_scroll_offset, fit_width, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
 };
 
@@ -884,28 +884,7 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
 
 // Widths are terminal cells, not bytes or Unicode scalar values.
 fn fixed_column(value: &str, width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-    let value = dash_empty(value);
-    if UnicodeWidthStr::width(value) <= width {
-        return format!(
-            "{}{}",
-            value,
-            " ".repeat(width - UnicodeWidthStr::width(value))
-        );
-    }
-    let mut result = String::new();
-    let mut used = 0;
-    for ch in value.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + char_width > width.saturating_sub(1) {
-            break;
-        }
-        result.push(ch);
-        used += char_width;
-    }
-    result.push('…');
-    result.push_str(&" ".repeat(width - used - 1));
-    result
+    fit_width(dash_empty(value), width)
 }
 
 #[cfg(test)]

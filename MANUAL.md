@@ -297,6 +297,9 @@ records. Replay shows:
 Thinking blocks, other tools, and records injected by Claude Code are not
 shown.
 
+Each timeline row ends with the time of its record as `YYYY-mm-dd HH:mm`,
+copied from the transcript timestamp (UTC), or `-` when the record has none.
+
 | Key | Action |
 | --- | --- |
 | `j` / `k`, Up / Down | Move timeline selection or scroll detail. |

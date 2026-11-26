@@ -36,13 +36,15 @@ not a shell command.
 | `h` / `l`, Left / Right | Horizontally scroll session metadata. |
 | `0` | Reset metadata horizontal scroll. |
 | `/` | Start a search. |
+| `s` | Focus the header row to sort or filter by column; see [Sort and column filters](#sort-and-column-filters). |
 | `i` | Show full metadata for the selected session; use `j` / `k`, `d` / `u`, or `g` / `G` to scroll and `i`, `Esc`, or `q` to close. |
 | `e` | Toggle initial Bash visibility for the next replay. |
 | `Enter` | Replay the selected session. |
 | `y` | Copy `cd '<cwd>' && claude --resume <session-id>`. |
 | `p` | Select the parent session of a subsession. |
 | `?` | Open help. |
-| `q`, Ctrl-C, Esc | Quit, or leave search/help when active. |
+| `Esc` | Clear the search, then the column filters, then the sort; quit when none is active. Leaves search, help, or the header first. |
+| `q`, Ctrl-C | Quit. |
 
 A header row names the columns: `Modified | Path | Branch | Repository |
 Title`; a missing value is shown as `-`. `Modified` is when the transcript
@@ -83,12 +85,12 @@ parent`. While searching, `p` is search text.
 
 ## Search
 
-Metadata search is case-insensitive all-term substring matching across the
+The `any` search is case-insensitive all-term substring matching across the
 first message, title, subagent type, cwd, repository, branch, timestamp, and
 date. Content search uses persistent FTS5/BM25 indexes over normalized user
 messages, agent messages, Bash commands, and Bash outputs.
 
-Use `Tab` during a search to choose `metadata`, `content:all`, `content:user`,
+Use `Tab` during a search to choose `any`, `content:all`, `content:user`,
 `content:agent`, or `content:exec`. Bare terms use AND and token-prefix
 matching: `fix read` finds “Fix README parser”; `"readme parser"` is an exact
 phrase; whitespace-delimited `|` separates OR groups. The FTS tokenizer is
@@ -101,6 +103,32 @@ execution-visibility command.
 When Claude Code continues a session, the new transcript starts with a copy of
 the previous one. Both transcripts are indexed as they are, so content search
 can return both sessions for the copied part.
+
+
+`Enter` accepts the search and `Esc` cancels it, restoring the previous query
+and target.
+
+## Sort and column filters
+
+`s` moves the focus to the header row; the focused column is shown reversed
+and the list scrolls to keep it in view. `s`, `Esc`, `j`, or Down returns to
+the rows.
+
+| Key | Action |
+| --- | --- |
+| `1`-`5` | Focus Modified, Path, Branch, Repository, or Title. |
+| `h` / `l`, Left / Right | Focus the previous or next column. |
+| `Enter` | Sort by the column: descending, ascending, then the default order. |
+| `/` | Filter the column (not Modified). |
+
+One column sorts at a time, case-insensitively and stably; rows without a
+value stay last. The default order is newest modified first, or relevance for
+a content search. A column filter is a case-insensitive substring match on
+that column alone, with spaces meaning AND. Filters on several columns and
+the global search all apply together. In the filter input, `Enter` accepts,
+`Enter` on an empty input removes the filter, and `Esc` restores the previous
+value. The header marks the sorted column with `▼` or `▲` and a filtered one
+with `*`; the top line lists both, as `sort: branch▼ | filter: path~ocr`.
 
 ## Index
 

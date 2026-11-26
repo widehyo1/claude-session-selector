@@ -24,6 +24,7 @@ use crate::{
 enum Mode {
     Normal,
     Search,
+    ColumnSearch(Column),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,22 +35,22 @@ enum PaneFocus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchTarget {
-    Metadata,
+    Any,
     Content(ContentScope),
 }
 impl SearchTarget {
     fn next(self) -> Self {
         match self {
-            Self::Metadata => Self::Content(ContentScope::All),
+            Self::Any => Self::Content(ContentScope::All),
             Self::Content(ContentScope::All) => Self::Content(ContentScope::User),
             Self::Content(ContentScope::User) => Self::Content(ContentScope::Agent),
             Self::Content(ContentScope::Agent) => Self::Content(ContentScope::Exec),
-            Self::Content(ContentScope::Exec) => Self::Metadata,
+            Self::Content(ContentScope::Exec) => Self::Any,
         }
     }
     fn label(self) -> &'static str {
         match self {
-            Self::Metadata => "metadata",
+            Self::Any => "any",
             Self::Content(ContentScope::All) => "content:all",
             Self::Content(ContentScope::User) => "content:user",
             Self::Content(ContentScope::Agent) => "content:agent",
@@ -57,6 +58,93 @@ impl SearchTarget {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Modified,
+    Path,
+    Branch,
+    Repository,
+    Title,
+}
+
+impl Column {
+    const ALL: [Self; 5] = [
+        Self::Modified,
+        Self::Path,
+        Self::Branch,
+        Self::Repository,
+        Self::Title,
+    ];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Modified => "Modified",
+            Self::Path => "Path",
+            Self::Branch => "Branch",
+            Self::Repository => "Repository",
+            Self::Title => "Title",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Modified => "modified",
+            Self::Path => "path",
+            Self::Branch => "branch",
+            Self::Repository => "repository",
+            Self::Title => "title",
+        }
+    }
+
+    /// Width in terminal cells; the title column is unbounded.
+    fn width(self) -> Option<usize> {
+        match self {
+            Self::Modified => Some(MODIFIED_WIDTH),
+            Self::Path => Some(PATH_WIDTH),
+            Self::Branch => Some(BRANCH_WIDTH),
+            Self::Repository => Some(REPOSITORY_WIDTH),
+            Self::Title => None,
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Modified => Color::Cyan,
+            Self::Path => Color::Green,
+            Self::Branch => Color::Yellow,
+            Self::Repository => Color::Magenta,
+            Self::Title => Color::White,
+        }
+    }
+
+    fn value(self, row: &SessionRow) -> &str {
+        match self {
+            Self::Modified => row.file_modified_at.as_deref(),
+            Self::Path => row.cwd.as_deref(),
+            Self::Branch => row.branch.as_deref(),
+            Self::Repository => row.repository_url.as_deref(),
+            Self::Title => row.title.as_deref(),
+        }
+        .unwrap_or_default()
+    }
+
+    fn searchable(self) -> bool {
+        self != Self::Modified
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Desc,
+    Asc,
+}
+
+type ColumnFilters = [String; Column::ALL.len()];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParentJump {
@@ -76,13 +164,22 @@ pub(crate) struct SelectorApp {
     all_rows: Vec<SessionRow>,
     total_rows: usize,
     show_subsession_badges: bool,
+    /// Result of the global search, before column filters and sort.
+    search_rows: Vec<SessionRow>,
     filtered: Vec<SessionRow>,
     list_state: ListState,
     query: String,
     search_target: SearchTarget,
+    column_filters: ColumnFilters,
+    sort: Option<(Column, SortDirection)>,
+    /// Input and target to restore when a search is cancelled with Esc.
+    search_backup: Option<(String, SearchTarget)>,
     mode: Mode,
     focus: PaneFocus,
+    header_focus: bool,
+    header_column: Column,
     metadata_scroll: usize,
+    sessions_view_width: u16,
     message_scroll: u16,
     sessions_page_height: u16,
     message_page_height: u16,
@@ -111,13 +208,20 @@ impl SelectorApp {
             all_rows: filtered.clone(),
             total_rows,
             show_subsession_badges,
+            search_rows: filtered.clone(),
             filtered,
             list_state,
             query: String::new(),
-            search_target: SearchTarget::Metadata,
+            search_target: SearchTarget::Any,
+            column_filters: Default::default(),
+            sort: None,
+            search_backup: None,
             mode: Mode::Normal,
             focus: PaneFocus::Sessions,
+            header_focus: false,
+            header_column: Column::Modified,
             metadata_scroll: 0,
+            sessions_view_width: 0,
             message_scroll: 0,
             sessions_page_height: 1,
             message_page_height: 1,
@@ -180,7 +284,7 @@ impl SelectorApp {
 
     fn refresh_filter(&mut self) {
         let result = match self.search_target {
-            SearchTarget::Metadata => Ok(filter_sessions(&self.all_rows, &self.query)),
+            SearchTarget::Any => Ok(filter_sessions(&self.all_rows, &self.query)),
             SearchTarget::Content(scope) => self
                 .search_index
                 .search_content(&self.query, scope)
@@ -188,16 +292,180 @@ impl SelectorApp {
         };
         match result {
             Ok(rows) => {
-                self.filtered = rows;
-                self.list_state
-                    .select((!self.filtered.is_empty()).then_some(0));
-                self.message_scroll = 0;
+                self.search_rows = rows;
+                self.apply_view(false);
                 self.status = None;
             }
             Err(error) => {
                 self.status = Some(format_search_error(&error));
             }
         }
+    }
+
+    /// Applies the column filters and the sort to the global search result.
+    /// A sort change keeps the selected session; a filter change selects the
+    /// first row.
+    fn apply_view(&mut self, keep_selection: bool) {
+        let selected = if keep_selection {
+            self.selected_path()
+        } else {
+            None
+        };
+        let mut rows: Vec<SessionRow> = self
+            .search_rows
+            .iter()
+            .filter(|row| matches_column_filters(&self.column_filters, row))
+            .cloned()
+            .collect();
+        if let Some((column, direction)) = self.sort {
+            rows.sort_by(|left, right| compare_column(column, direction, left, right));
+        }
+        self.filtered = rows;
+        let index = selected
+            .and_then(|path| self.filtered.iter().position(|row| row.path == path))
+            .or((!self.filtered.is_empty()).then_some(0));
+        if !keep_selection || index != self.selected_index() {
+            self.message_scroll = 0;
+        }
+        self.list_state.select(index);
+    }
+
+    /// Cycles the column through desc, asc, and the default order.
+    fn cycle_sort(&mut self, column: Column) {
+        self.sort = match self.sort {
+            Some((current, SortDirection::Desc)) if current == column => {
+                Some((column, SortDirection::Asc))
+            }
+            Some((current, SortDirection::Asc)) if current == column => None,
+            _ => Some((column, SortDirection::Desc)),
+        };
+        self.apply_view(true);
+    }
+
+    fn enter_header(&mut self) {
+        self.focus = PaneFocus::Sessions;
+        self.header_focus = true;
+        self.ensure_column_visible();
+    }
+
+    fn focus_column(&mut self, column: Column) {
+        self.header_column = column;
+        self.ensure_column_visible();
+    }
+
+    fn focus_adjacent_column(&mut self, forward: bool) {
+        let index = self.header_column.index();
+        let next = if forward {
+            (index + 1).min(Column::ALL.len() - 1)
+        } else {
+            index.saturating_sub(1)
+        };
+        self.focus_column(Column::ALL[next]);
+    }
+
+    /// Scrolls horizontally so the focused column is in view.
+    fn ensure_column_visible(&mut self) {
+        let view = usize::from(self.sessions_view_width);
+        let column = self.header_column;
+        if column == Column::ALL[0] {
+            self.metadata_scroll = 0;
+            return;
+        }
+        let start = column_start(column, self.show_subsession_badges);
+        let width = column.width().unwrap_or(column.label().len() + 2);
+        if start < self.metadata_scroll {
+            self.metadata_scroll = start;
+        } else if view > 0 && start + width > self.metadata_scroll + view {
+            self.metadata_scroll = (start + width).saturating_sub(view);
+        }
+    }
+
+    fn start_search(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.search_backup = Some((self.search_input().clone(), self.search_target));
+    }
+
+    fn search_input(&self) -> &String {
+        match self.mode {
+            Mode::ColumnSearch(column) => &self.column_filters[column.index()],
+            _ => &self.query,
+        }
+    }
+
+    fn search_input_mut(&mut self) -> &mut String {
+        match self.mode {
+            Mode::ColumnSearch(column) => &mut self.column_filters[column.index()],
+            _ => &mut self.query,
+        }
+    }
+
+    fn refresh_search(&mut self) {
+        match self.mode {
+            Mode::ColumnSearch(_) => self.apply_view(false),
+            _ => self.refresh_filter(),
+        }
+    }
+
+    fn cancel_search(&mut self) {
+        if let Some((input, target)) = self.search_backup.take() {
+            let changed = *self.search_input() != input || self.search_target != target;
+            *self.search_input_mut() = input;
+            self.search_target = target;
+            if changed {
+                self.refresh_search();
+            }
+        }
+        self.mode = Mode::Normal;
+    }
+
+    /// Esc in the session list: clears the global search, then the column
+    /// filters, then the sort. Returns false when nothing was active.
+    fn clear_one_layer(&mut self) -> bool {
+        if !self.query.is_empty() {
+            self.query.clear();
+            self.refresh_filter();
+        } else if self.column_filters.iter().any(|filter| !filter.is_empty()) {
+            self.column_filters = Default::default();
+            self.apply_view(false);
+        } else if self.sort.is_some() {
+            self.sort = None;
+            self.apply_view(true);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn handle_header_key(&mut self, key: KeyEvent) -> Option<SelectorAction> {
+        match key.code {
+            KeyCode::Char('q') => return Some(SelectorAction::Quit),
+            KeyCode::Esc | KeyCode::Char('s') | KeyCode::Char('j') | KeyCode::Down => {
+                self.header_focus = false
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.focus_adjacent_column(false),
+            KeyCode::Char('l') | KeyCode::Right => self.focus_adjacent_column(true),
+            KeyCode::Char(ch @ '1'..='5') => {
+                self.focus_column(Column::ALL[usize::from(ch as u8 - b'1')])
+            }
+            KeyCode::Enter => self.cycle_sort(self.header_column),
+            KeyCode::Char('/') => {
+                if self.header_column.searchable() {
+                    self.start_search(Mode::ColumnSearch(self.header_column));
+                } else {
+                    self.status = Some(format!(
+                        "{} is not searchable; Enter sorts it",
+                        self.header_column.name()
+                    ));
+                }
+            }
+            KeyCode::Char('?') => self.show_help = true,
+            KeyCode::Tab => {
+                self.header_focus = false;
+                self.toggle_focus();
+            }
+            _ => {}
+        }
+        None
     }
 
     fn toggle_focus(&mut self) {
@@ -390,16 +658,31 @@ impl SelectorApp {
             return None;
         }
 
+        if self.mode == Mode::Normal && self.header_focus {
+            return self.handle_header_key(key);
+        }
+
         match self.mode {
             Mode::Normal => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => Some(SelectorAction::Quit),
+                KeyCode::Char('q') => Some(SelectorAction::Quit),
+                KeyCode::Esc => {
+                    if self.clear_one_layer() {
+                        None
+                    } else {
+                        Some(SelectorAction::Quit)
+                    }
+                }
+                KeyCode::Char('s') if key.modifiers.is_empty() => {
+                    self.enter_header();
+                    None
+                }
                 KeyCode::Enter => self.selected_path().map(SelectorAction::OpenReplay),
                 KeyCode::Char('e') if key.modifiers.is_empty() => {
                     self.toggle_exec_visibility();
                     None
                 }
                 KeyCode::Char('/') => {
-                    self.mode = Mode::Search;
+                    self.start_search(Mode::Search);
                     None
                 }
                 KeyCode::Char('?') => {
@@ -485,17 +768,21 @@ impl SelectorApp {
                 }
                 _ => None,
             },
-            Mode::Search => {
+            Mode::Search | Mode::ColumnSearch(_) => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Normal,
-                    KeyCode::Tab => self.next_search_target(),
+                    KeyCode::Enter => {
+                        self.mode = Mode::Normal;
+                        self.search_backup = None;
+                    }
+                    KeyCode::Esc => self.cancel_search(),
+                    KeyCode::Tab if self.mode == Mode::Search => self.next_search_target(),
                     KeyCode::Backspace => {
-                        self.query.pop();
-                        self.refresh_filter();
+                        self.search_input_mut().pop();
+                        self.refresh_search();
                     }
                     KeyCode::Char(ch) => {
-                        self.query.push(ch);
-                        self.refresh_filter();
+                        self.search_input_mut().push(ch);
+                        self.refresh_search();
                     }
                     _ => {}
                 }
@@ -581,6 +868,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             app.total_rows,
             app.exec_visibility.label()
         )),
+        Span::styled(view_summary(app), Style::default().fg(Color::Yellow)),
     ]);
 
     frame.render_widget(header, area);
@@ -588,11 +876,35 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
 
 const HIGHLIGHT_SYMBOL: &str = "▶ ";
 
+/// Active sort and column filters, e.g. ` | sort: branch▼ | filter: path~ocr`.
+fn view_summary(app: &SelectorApp) -> String {
+    let mut summary = String::new();
+    if let Some((column, direction)) = app.sort {
+        let arrow = match direction {
+            SortDirection::Desc => "▼",
+            SortDirection::Asc => "▲",
+        };
+        summary.push_str(&format!(" | sort: {}{arrow}", column.name()));
+    }
+    let filters: Vec<String> = Column::ALL
+        .into_iter()
+        .filter(|column| !app.column_filters[column.index()].is_empty())
+        .map(|column| format!("{}~{}", column.name(), app.column_filters[column.index()]))
+        .collect();
+    if !filters.is_empty() {
+        summary.push_str(&format!(" | filter: {}", filters.join(" ")));
+    }
+    summary
+}
+
 fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
     let content = pane_content_area(area);
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
     app.sessions_page_height = list_area.height.max(1);
+    app.sessions_view_width = list_area
+        .width
+        .saturating_sub(HIGHLIGHT_SYMBOL.chars().count() as u16);
 
     let items: Vec<ListItem> = app
         .filtered
@@ -606,15 +918,18 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
         })
         .collect();
 
-    let title = if app.mode == Mode::Search {
+    let header_focused = app.mode == Mode::Normal && app.header_focus;
+    let title = if app.mode != Mode::Normal {
         " Sessions [search] "
+    } else if header_focused {
+        " Sessions [header] "
     } else if app.focus == PaneFocus::Sessions {
         " Sessions [focus] "
     } else {
         " Sessions "
     };
 
-    let border_style = if app.mode == Mode::Search {
+    let border_style = if app.mode != Mode::Normal {
         Style::default().fg(Color::Yellow)
     } else if app.focus == PaneFocus::Sessions {
         Style::default().fg(Color::Cyan)
@@ -630,8 +945,18 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
         area,
     );
 
+    let focused_column = match app.mode {
+        Mode::ColumnSearch(column) => Some(column),
+        Mode::Normal if app.header_focus => Some(app.header_column),
+        _ => None,
+    };
     let mut header = scrolled_segments(
-        &header_segments(app.show_subsession_badges),
+        &header_segments(
+            app.show_subsession_badges,
+            app.sort,
+            &app.column_filters,
+            focused_column,
+        ),
         app.metadata_scroll,
     );
     header
@@ -724,6 +1049,19 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
         .unwrap_or_default();
 
     let footer = match app.mode {
+        Mode::Normal if app.header_focus => Line::from(vec![
+            Span::raw(" focus: "),
+            Span::styled("header", Style::default().fg(Color::Cyan)),
+            Span::raw(" | "),
+            Span::raw(" 1-5 column "),
+            Span::raw(" h/l ←/→ move "),
+            Span::raw(" Enter sort desc/asc/default "),
+            Span::raw(" / filter column "),
+            Span::raw(" Esc/s/j back "),
+            Span::raw(" q quit "),
+            Span::raw(" ? help "),
+            Span::styled(status, Style::default().fg(Color::Yellow)),
+        ]),
         Mode::Normal => Line::from(vec![
             Span::raw(" focus: "),
             Span::styled(app.focus.label(), Style::default().fg(Color::Cyan)),
@@ -734,12 +1072,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" h/l ←/→ x-scroll "),
             Span::raw(" Tab focus "),
             Span::raw(" / search "),
+            Span::raw(" s header "),
             Span::raw(" Enter replay "),
             Span::raw(" i details "),
             Span::raw(" e exec "),
             Span::raw(" y copy-resume "),
             Span::raw(" p parent "),
             Span::raw(" q quit "),
+            Span::raw(" Esc clear/quit "),
             Span::raw(" Ctrl-C quit "),
             Span::raw(" ? help "),
             Span::styled(status, Style::default().fg(Color::Yellow)),
@@ -750,6 +1090,17 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" /"),
             Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
             Span::raw("  Tab target  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
+            Span::styled(status, Style::default().fg(Color::Yellow)),
+        ]),
+        Mode::ColumnSearch(column) => Line::from(vec![
+            Span::raw(" filter: "),
+            Span::styled(column.name(), Style::default().fg(Color::Cyan)),
+            Span::raw(" /"),
+            Span::styled(
+                app.column_filters[column.index()].clone(),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw("  Enter accept (empty removes)  Esc cancel  Ctrl-C quit  Backspace delete "),
             Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
     }
@@ -775,7 +1126,7 @@ fn render_help(frame: &mut Frame) {
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
-        Line::raw("Left pane shows date, title, cwd, branch, and repository."),
+        Line::raw("Left pane shows modified time, path, branch, repository, and title."),
         Line::raw("Badges: + main, - sub, > continued in another session."),
         Line::raw("Right pane shows the selected session's first user message."),
         Line::raw(""),
@@ -793,11 +1144,19 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  l / Right       horizontal scroll session metadata right"),
         Line::raw("  0               reset horizontal scroll"),
         Line::raw(""),
+        Line::raw("Header (sort and column filters)"),
+        Line::raw("  s               focus the header row; s/Esc/j/Down return to rows"),
+        Line::raw("  1-5             focus Modified/Path/Branch/Repository/Title"),
+        Line::raw("  h/l, Left/Right previous/next column"),
+        Line::raw("  Enter           sort the column: desc -> asc -> default"),
+        Line::raw("  /               filter Path/Branch/Repository/Title by substring"),
+        Line::raw(""),
         Line::raw("Search"),
         Line::raw("  /               interactive search"),
-        Line::raw("  Tab             cycle metadata/content:all/user/agent/exec"),
-        Line::raw("  Enter           accept search"),
-        Line::raw("  Esc             leave search/help or quit"),
+        Line::raw("  Tab             cycle any/content:all/user/agent/exec"),
+        Line::raw("  Enter           accept search (an empty column filter is removed)"),
+        Line::raw("  Esc             cancel: restore the previous input"),
+        Line::raw("  Esc (list)      clear search, then column filters, then sort; then quit"),
         Line::raw(""),
         Line::raw("Other"),
         Line::raw("  i               show full metadata for the selected session"),
@@ -862,34 +1221,93 @@ const PATH_WIDTH: usize = 24;
 const BRANCH_WIDTH: usize = 12;
 const REPOSITORY_WIDTH: usize = 28;
 
-/// Column headers aligned with `metadata_segments`; each name fits its width.
-fn header_segments(show_subsession_badge: bool) -> Vec<(String, Style)> {
-    let separator = (" | ".to_string(), Style::default().fg(Color::DarkGray));
-    let prefix = if show_subsession_badge { "  " } else { " " };
-    vec![
-        (prefix.to_string(), Style::default()),
-        (
-            fit_width("Modified", MODIFIED_WIDTH),
-            Style::default().fg(Color::Cyan),
-        ),
-        separator.clone(),
-        (
-            fit_width("Path", PATH_WIDTH),
-            Style::default().fg(Color::Green),
-        ),
-        separator.clone(),
-        (
-            fit_width("Branch", BRANCH_WIDTH),
-            Style::default().fg(Color::Yellow),
-        ),
-        separator.clone(),
-        (
-            fit_width("Repository", REPOSITORY_WIDTH),
-            Style::default().fg(Color::Magenta),
-        ),
-        separator,
-        ("Title".to_string(), Style::default().fg(Color::White)),
-    ]
+fn row_prefix_width(show_subsession_badge: bool) -> usize {
+    if show_subsession_badge { 2 } else { 1 }
+}
+
+const SEPARATOR: &str = " | ";
+
+/// Offset of the column from the start of a row, before horizontal scroll.
+fn column_start(column: Column, show_subsession_badge: bool) -> usize {
+    row_prefix_width(show_subsession_badge)
+        + Column::ALL[..column.index()]
+            .iter()
+            .map(|previous| previous.width().unwrap_or(0) + SEPARATOR.len())
+            .sum::<usize>()
+}
+
+/// Column headers aligned with `metadata_segments`. A sorted column shows
+/// ▼/▲, a filtered one `*`, and the focused one is reversed.
+fn header_segments(
+    show_subsession_badge: bool,
+    sort: Option<(Column, SortDirection)>,
+    filters: &ColumnFilters,
+    focused: Option<Column>,
+) -> Vec<(String, Style)> {
+    let mut segments = vec![(
+        " ".repeat(row_prefix_width(show_subsession_badge)),
+        Style::default(),
+    )];
+    for (index, column) in Column::ALL.into_iter().enumerate() {
+        if index > 0 {
+            segments.push((SEPARATOR.to_string(), Style::default().fg(Color::DarkGray)));
+        }
+        let mut label = column.label().to_string();
+        match sort {
+            Some((sorted, SortDirection::Desc)) if sorted == column => label.push_str(" ▼"),
+            Some((sorted, SortDirection::Asc)) if sorted == column => label.push_str(" ▲"),
+            _ => {}
+        }
+        if !filters[column.index()].is_empty() {
+            label.push('*');
+        }
+        let mut style = Style::default().fg(column.color());
+        if focused == Some(column) {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let text = match column.width() {
+            Some(width) => fit_width(&label, width),
+            None => label,
+        };
+        segments.push((text, style));
+    }
+    segments
+}
+
+fn matches_column_filters(filters: &ColumnFilters, row: &SessionRow) -> bool {
+    Column::ALL.into_iter().all(|column| {
+        let filter = &filters[column.index()];
+        if filter.trim().is_empty() {
+            return true;
+        }
+        let value = column.value(row).to_lowercase();
+        filter
+            .split_whitespace()
+            .all(|term| value.contains(&term.to_lowercase()))
+    })
+}
+
+/// Case-insensitive order; missing values stay last in both directions.
+fn compare_column(
+    column: Column,
+    direction: SortDirection,
+    left: &SessionRow,
+    right: &SessionRow,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (left, right) = (column.value(left), column.value(right));
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            let order = left.to_lowercase().cmp(&right.to_lowercase());
+            match direction {
+                SortDirection::Desc => order.reverse(),
+                SortDirection::Asc => order,
+            }
+        }
+    }
 }
 
 fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(String, Style)> {
@@ -1210,12 +1628,12 @@ mod tests {
     #[test]
     fn search_target_cycles_through_content_scopes() {
         let scopes = [
-            SearchTarget::Metadata,
+            SearchTarget::Any,
             SearchTarget::Content(ContentScope::All),
             SearchTarget::Content(ContentScope::User),
             SearchTarget::Content(ContentScope::Agent),
             SearchTarget::Content(ContentScope::Exec),
-            SearchTarget::Metadata,
+            SearchTarget::Any,
         ];
 
         for pair in scopes.windows(2) {
@@ -1225,18 +1643,248 @@ mod tests {
 
     #[test]
     fn search_target_labels_are_visible() {
-        assert_eq!(SearchTarget::Metadata.label(), "metadata");
+        assert_eq!(SearchTarget::Any.label(), "any");
         assert_eq!(
             SearchTarget::Content(ContentScope::Exec).label(),
             "content:exec"
         );
     }
 
+    /// Three sessions with distinct sortable values; the order is the default.
+    fn header_app() -> (SessionFixture, SelectorApp) {
+        let (fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        let template = app.search_rows[0].clone();
+        let row = |path: &str, cwd: &str, branch: Option<&str>| SessionRow {
+            path: PathBuf::from(path),
+            cwd: Some(cwd.to_string()),
+            branch: branch.map(str::to_string),
+            ..template.clone()
+        };
+        app.search_rows = vec![
+            row("/tmp/1.jsonl", "/repo/beta", Some("main")),
+            row("/tmp/2.jsonl", "/repo/alpha", None),
+            row("/tmp/3.jsonl", "/repo/Gamma", Some("feat/ocr")),
+        ];
+        app.all_rows = app.search_rows.clone();
+        app.apply_view(false);
+        (fixture, app)
+    }
+
+    fn paths(app: &SelectorApp) -> Vec<String> {
+        app.filtered
+            .iter()
+            .map(|row| row.path.file_stem().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn type_text(app: &mut SelectorApp, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+    }
+
+    #[test]
+    fn s_enters_the_header_and_number_or_h_l_move_the_column_focus() {
+        let (_fixture, mut app) = header_app();
+        app.focus = PaneFocus::Message;
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.header_focus);
+        assert_eq!(app.focus, PaneFocus::Sessions);
+        assert_eq!(app.header_column, Column::Modified);
+
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.header_column, Column::Branch);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.header_column, Column::Repository);
+        app.handle_key(key(KeyCode::Char('5')));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.header_column, Column::Title);
+        app.handle_key(key(KeyCode::Char('1')));
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.header_column, Column::Modified);
+
+        // j in the header returns to the rows without moving the selection.
+        app.handle_key(key(KeyCode::Char('j')));
+        assert!(!app.header_focus);
+        assert_eq!(app.selected_index(), Some(0));
+        app.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(app.header_column, Column::Modified, "column is remembered");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.header_focus);
+    }
+
+    #[test]
+    fn enter_cycles_desc_asc_default_and_keeps_the_selected_session() {
+        let (_fixture, mut app) = header_app();
+        app.list_state.select(Some(1)); // "2" (/repo/alpha)
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('2')));
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.sort, Some((Column::Path, SortDirection::Desc)));
+        assert_eq!(paths(&app), ["3", "1", "2"], "case-insensitive");
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            PathBuf::from("/tmp/2.jsonl")
+        );
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(paths(&app), ["2", "1", "3"]);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.sort, None);
+        assert_eq!(paths(&app), ["1", "2", "3"]);
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            PathBuf::from("/tmp/2.jsonl")
+        );
+    }
+
+    #[test]
+    fn missing_values_sort_last_in_both_directions() {
+        let (_fixture, mut app) = header_app();
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('3')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(paths(&app), ["1", "3", "2"]);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(paths(&app), ["3", "1", "2"]);
+    }
+
+    #[test]
+    fn column_filter_narrows_the_list_and_esc_restores_the_previous_value() {
+        let (_fixture, mut app) = header_app();
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('2')));
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::ColumnSearch(Column::Path));
+
+        type_text(&mut app, "ALP");
+        assert_eq!(paths(&app), ["2"], "filters while typing");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(app.header_focus, "back to the header after a filter");
+        assert_eq!(app.column_filters[Column::Path.index()], "ALP");
+
+        app.handle_key(key(KeyCode::Char('/')));
+        type_text(&mut app, "ha zzz");
+        assert!(app.filtered.is_empty());
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.column_filters[Column::Path.index()], "ALP");
+        assert_eq!(paths(&app), ["2"]);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.column_filters[Column::Path.index()], "");
+        assert_eq!(paths(&app), ["1", "2", "3"]);
+    }
+
+    #[test]
+    fn column_filters_combine_with_and() {
+        let (_fixture, mut app) = header_app();
+        app.column_filters[Column::Path.index()] = "repo".into();
+        app.column_filters[Column::Branch.index()] = "ma".into();
+        app.apply_view(false);
+        assert_eq!(paths(&app), ["1"], "a missing branch never matches");
+    }
+
+    #[test]
+    fn modified_column_is_sortable_but_not_searchable() {
+        let (_fixture, mut app) = header_app();
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('/')));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("modified is not searchable; Enter sorts it")
+        );
+    }
+
+    #[test]
+    fn esc_in_the_list_clears_search_then_filters_then_sort_then_quits() {
+        let (_fixture, mut app) = header_app();
+        app.query = "x".into();
+        app.column_filters[Column::Branch.index()] = "main".into();
+        app.sort = Some((Column::Path, SortDirection::Asc));
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(app.query.is_empty());
+        assert_eq!(app.column_filters[Column::Branch.index()], "main");
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert!(app.column_filters.iter().all(String::is_empty));
+        assert!(app.sort.is_some());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.sort, None);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            Some(SelectorAction::Quit)
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_global_search_and_restores_query_and_target() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.handle_key(key(KeyCode::Char('/')));
+        type_text(&mut app, "readme");
+        app.handle_key(key(KeyCode::Enter));
+        let accepted = app.filtered.clone();
+        assert_eq!(accepted.len(), 1);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Tab));
+        type_text(&mut app, " zzz");
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.query, "readme");
+        assert_eq!(app.search_target, SearchTarget::Any);
+        assert_eq!(app.filtered, accepted);
+    }
+
+    #[test]
+    fn focusing_a_column_scrolls_it_into_view() {
+        let (_fixture, mut app) = header_app();
+        render_at(&mut app, 100, 12);
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('5')));
+        let view = usize::from(app.sessions_view_width);
+        let start = column_start(Column::Title, false);
+        assert!(app.metadata_scroll > 0);
+        assert!(start >= app.metadata_scroll && start + 7 <= app.metadata_scroll + view);
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.metadata_scroll, 0);
+    }
+
+    #[test]
+    fn header_shows_sort_arrow_filter_mark_and_focus() {
+        let mut filters = ColumnFilters::default();
+        filters[Column::Branch.index()] = "feat".into();
+        let segments = header_segments(
+            false,
+            Some((Column::Repository, SortDirection::Asc)),
+            &filters,
+            Some(Column::Path),
+        );
+        let text: String = segments.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(text.contains("| Branch*      |"), "{text}");
+        assert!(text.contains("| Repository ▲ "), "{text}");
+        let path = segments
+            .iter()
+            .find(|(t, _)| t.starts_with("Path"))
+            .unwrap();
+        assert!(path.1.add_modifier.contains(Modifier::REVERSED));
+    }
+
     #[test]
     fn header_columns_align_with_row_columns() {
         let rows = sample_rows();
         for badge in [false, true] {
-            let header: String = header_segments(badge).into_iter().map(|(t, _)| t).collect();
+            let header: String = header_segments(badge, None, &ColumnFilters::default(), None)
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect();
             let row = metadata_plain(&rows[0], badge);
             let separators = |line: &str| {
                 line.match_indices(" | ")

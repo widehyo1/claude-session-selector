@@ -49,8 +49,8 @@ select-claude-session --include-exec
 ```
 
 Each row shows when the transcript was last modified, the working directory,
-git branch, repository, and session title, newest first. Press `/` to search, `Tab` to select metadata or a content scope,
-and `e` to choose whether the next replay shows Bash commands.
+git branch, repository, and session title, newest first. Press `/` to search, `Tab` to select `any` or a content scope,
+`s` to sort or filter by a header column, and `e` to choose whether the next replay shows Bash commands.
 
 - `y` copies `cd '<cwd>' && claude --resume <session-id>`.
 - With `--include-subsessions`, rows are labelled `+` (main) or `-` (sub). On a

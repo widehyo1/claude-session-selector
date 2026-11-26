@@ -7,7 +7,14 @@
   the minute (`2026-11-25T10:46Z`); the `i` details still show the date.
 - Shorten long paths and branch names from the start (`…ne/project`) so the
   last segments stay visible, and narrow the branch column to 12 cells.
-- Add a header row to the session list.
+- Add a header row to the session list. `s` focuses it; `1`-`5` or `h` / `l`
+  pick a column, `Enter` sorts by it (descending, ascending, default), and `/`
+  filters Path, Branch, Repository, or Title by substring. Filters combine
+  with each other and with the global search.
+- `Esc` now cancels a search and restores the previous query instead of
+  accepting it. In the list it clears the search, then the column filters,
+  then the sort, and quits only when none is active; `q` still quits at once.
+- Rename the `metadata` search target to `any`.
 
 ## 0.3.2
 

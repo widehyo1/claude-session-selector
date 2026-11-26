@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Order the session list by file modified time, newest first, and drop the
+  session start date column. The modified time is shown as ISO 8601 UTC to
+  the minute (`2026-11-25T10:46Z`); the `i` details still show the date.
+- Shorten long paths and branch names from the start (`…ne/project`) so the
+  last segments stay visible, and narrow the branch column to 12 cells.
+- Add a header row to the session list.
+
 ## 0.3.2
 
 - Add a `YYYY-mm-dd HH:mm` time column at the end of each replay timeline row,

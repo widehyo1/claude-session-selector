@@ -48,8 +48,8 @@ select-claude-session replay ~/.claude/projects/-Users-me-repo/<session-id>.json
 select-claude-session --include-exec
 ```
 
-Each row shows the date, session title, working directory, git branch, and
-repository. Press `/` to search, `Tab` to select metadata or a content scope,
+Each row shows when the transcript was last modified, the working directory,
+git branch, repository, and session title, newest first. Press `/` to search, `Tab` to select metadata or a content scope,
 and `e` to choose whether the next replay shows Bash commands.
 
 - `y` copies `cd '<cwd>' && claude --resume <session-id>`.

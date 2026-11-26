@@ -262,7 +262,7 @@ impl SearchIndex {
                  s.path, s.id, s.timestamp, s.cwd, s.repository_url, s.branch,
                  s.first_message, s.is_subsession, s.title, s.parent_session_id,
                  s.parent_tool_use_id, s.agent_type, s.continued_in_session_id,
-                 strftime('%Y-%m-%d %H:%M', f.modified_secs, 'unixepoch'),
+                 strftime('%Y-%m-%dT%H:%MZ', f.modified_secs, 'unixepoch'),
                  sessions_fts.rank
              FROM sessions_fts
              JOIN sessions AS s ON s.session_key = sessions_fts.rowid
@@ -295,12 +295,12 @@ impl SearchIndex {
             "SELECT s.path, s.id, s.timestamp, s.cwd, s.repository_url, s.branch,
                     s.first_message, s.is_subsession, s.title, s.parent_session_id,
                     s.parent_tool_use_id, s.agent_type, s.continued_in_session_id,
-                    strftime('%Y-%m-%d %H:%M', f.modified_secs, 'unixepoch')
+                    strftime('%Y-%m-%dT%H:%MZ', f.modified_secs, 'unixepoch')
              FROM sessions AS s
              JOIN source_files AS f ON f.source_key = s.source_key
              WHERE (?1 = 1 OR s.is_subsession = 0)
                AND (?2 = 1 OR s.has_nonempty_first_message = 1)
-             ORDER BY s.timestamp DESC, s.session_key DESC",
+             ORDER BY f.modified_secs DESC, s.timestamp DESC, s.session_key DESC",
         )?;
         let rows = stmt.query_map(
             params![

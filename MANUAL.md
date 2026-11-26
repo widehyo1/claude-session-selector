@@ -44,13 +44,14 @@ not a shell command.
 | `?` | Open help. |
 | `q`, Ctrl-C, Esc | Quit, or leave search/help when active. |
 
-Each row reads `date | file modified | cwd | branch | repository | title`; a
-missing value is shown as `-`. `date` is the session's first record date.
-`file modified` is when the transcript file was last written, as
-`YYYY-mm-dd HH:mm` UTC. It approximates the session's last activity, usually
-the end of the agent's last reply, not the last prompt. All columns except
-the title have fixed widths. Values that exceed their column are shortened with `…`; the
-title remains unshortened and can be viewed with horizontal scrolling. Press `i`
+A header row names the columns: `Modified | Path | Branch | Repository |
+Title`; a missing value is shown as `-`. `Modified` is when the transcript
+file was last written, as ISO 8601 UTC to the minute (`2026-11-25T10:46Z`).
+It approximates the session's last activity, usually the end of the agent's
+last reply, not the last prompt. The list is ordered by it, newest first. All
+columns except the title have fixed widths. Values that exceed their column are shortened with `…`:
+`Path` and `Branch` drop their start so the last segments stay visible, the
+others drop their end. The title remains unshortened and can be viewed with horizontal scrolling. Press `i`
 to see the full values of every field. Badge positions use one character each, with blank spaces for absent badges to keep the columns aligned. The bottom legend explains their colors and meanings.
 
 The default view hides subsessions and rows without a non-empty first user

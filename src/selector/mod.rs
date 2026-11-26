@@ -7,14 +7,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 
 use crate::{
     SessionRow, filter_sessions,
     indexer::search::{ContentScope, QueryError, SearchIndex, is_corruption},
     session_date, terminal,
-    ui::{bottom_scroll_offset, fit_width, half_page_height, pane_content_area},
+    ui::{bottom_scroll_offset, fit_width, fit_width_tail, half_page_height, pane_content_area},
     ui_state::ExecVisibility,
 };
 
@@ -584,8 +586,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &SelectorApp) {
     frame.render_widget(header, area);
 }
 
+const HIGHLIGHT_SYMBOL: &str = "▶ ";
+
 fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
-    app.sessions_page_height = pane_content_area(area).height.max(1);
+    let content = pane_content_area(area);
+    let [header_area, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+    app.sessions_page_height = list_area.height.max(1);
 
     let items: Vec<ListItem> = app
         .filtered
@@ -615,21 +622,36 @@ fn render_list(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
         Style::default()
     };
 
+    frame.render_widget(
+        Block::new()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style),
+        area,
+    );
+
+    let mut header = scrolled_segments(
+        &header_segments(app.show_subsession_badges),
+        app.metadata_scroll,
+    );
+    header
+        .spans
+        .insert(0, Span::raw(" ".repeat(HIGHLIGHT_SYMBOL.chars().count())));
+    frame.render_widget(
+        header.style(Style::default().add_modifier(Modifier::BOLD)),
+        header_area,
+    );
+
     let list = List::new(items)
-        .block(
-            Block::new()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(border_style),
-        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol(HIGHLIGHT_SYMBOL)
+        .highlight_spacing(HighlightSpacing::Always);
 
-    frame.render_stateful_widget(list, area, &mut app.list_state);
+    frame.render_stateful_widget(list, list_area, &mut app.list_state);
 }
 
 fn render_message(frame: &mut Frame, area: Rect, app: &mut SelectorApp) {
@@ -835,6 +857,41 @@ fn metadata_line(row: &SessionRow, show_subsession_badge: bool, scroll: usize) -
     scrolled_segments(&segments, scroll)
 }
 
+const MODIFIED_WIDTH: usize = 17;
+const PATH_WIDTH: usize = 24;
+const BRANCH_WIDTH: usize = 12;
+const REPOSITORY_WIDTH: usize = 28;
+
+/// Column headers aligned with `metadata_segments`; each name fits its width.
+fn header_segments(show_subsession_badge: bool) -> Vec<(String, Style)> {
+    let separator = (" | ".to_string(), Style::default().fg(Color::DarkGray));
+    let prefix = if show_subsession_badge { "  " } else { " " };
+    vec![
+        (prefix.to_string(), Style::default()),
+        (
+            fit_width("Modified", MODIFIED_WIDTH),
+            Style::default().fg(Color::Cyan),
+        ),
+        separator.clone(),
+        (
+            fit_width("Path", PATH_WIDTH),
+            Style::default().fg(Color::Green),
+        ),
+        separator.clone(),
+        (
+            fit_width("Branch", BRANCH_WIDTH),
+            Style::default().fg(Color::Yellow),
+        ),
+        separator.clone(),
+        (
+            fit_width("Repository", REPOSITORY_WIDTH),
+            Style::default().fg(Color::Magenta),
+        ),
+        separator,
+        ("Title".to_string(), Style::default().fg(Color::White)),
+    ]
+}
+
 fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(String, Style)> {
     let mut segments = Vec::new();
     if show_subsession_badge {
@@ -856,27 +913,28 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
     ));
     segments.extend([
         (
-            fixed_column(&session_date(row), 10),
+            fixed_column(
+                row.file_modified_at.as_deref().unwrap_or_default(),
+                MODIFIED_WIDTH,
+            ),
             Style::default().fg(Color::Cyan),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
         (
-            fixed_column(row.file_modified_at.as_deref().unwrap_or_default(), 16),
-            Style::default().fg(Color::Cyan),
-        ),
-        (" | ".to_string(), Style::default().fg(Color::DarkGray)),
-        (
-            fixed_column(row.cwd.as_deref().unwrap_or_default(), 24),
+            fixed_column_tail(row.cwd.as_deref().unwrap_or_default(), PATH_WIDTH),
             Style::default().fg(Color::Green),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
         (
-            fixed_column(row.branch.as_deref().unwrap_or_default(), 16),
+            fixed_column_tail(row.branch.as_deref().unwrap_or_default(), BRANCH_WIDTH),
             Style::default().fg(Color::Yellow),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
         (
-            fixed_column(row.repository_url.as_deref().unwrap_or_default(), 28),
+            fixed_column(
+                row.repository_url.as_deref().unwrap_or_default(),
+                REPOSITORY_WIDTH,
+            ),
             Style::default().fg(Color::Magenta),
         ),
         (" | ".to_string(), Style::default().fg(Color::DarkGray)),
@@ -891,6 +949,10 @@ fn metadata_segments(row: &SessionRow, show_subsession_badge: bool) -> Vec<(Stri
 // Widths are terminal cells, not bytes or Unicode scalar values.
 fn fixed_column(value: &str, width: usize) -> String {
     fit_width(dash_empty(value), width)
+}
+
+fn fixed_column_tail(value: &str, width: usize) -> String {
+    fit_width_tail(dash_empty(value), width)
 }
 
 #[cfg(test)]
@@ -1100,17 +1162,14 @@ mod tests {
                 .as_secs() as i64;
             let expected: String = conn
                 .query_row(
-                    "SELECT strftime('%Y-%m-%d %H:%M', ?1, 'unixepoch')",
+                    "SELECT strftime('%Y-%m-%dT%H:%MZ', ?1, 'unixepoch')",
                     [modified],
                     |r| r.get(0),
                 )
                 .unwrap();
             assert_eq!(row.file_modified_at.as_deref(), Some(expected.as_str()));
             let line = metadata_plain(row, false);
-            assert!(
-                line.starts_with(&format!(" {} | {expected} | ", session_date(row))),
-                "{line}"
-            );
+            assert!(line.starts_with(&format!(" {expected} | ")), "{line}");
             assert!(details_text(row).contains(&format!("File modified (UTC): {expected}")));
         }
     }
@@ -1174,9 +1233,26 @@ mod tests {
     }
 
     #[test]
+    fn header_columns_align_with_row_columns() {
+        let rows = sample_rows();
+        for badge in [false, true] {
+            let header: String = header_segments(badge).into_iter().map(|(t, _)| t).collect();
+            let row = metadata_plain(&rows[0], badge);
+            let separators = |line: &str| {
+                line.match_indices(" | ")
+                    .map(|(i, _)| unicode_width::UnicodeWidthStr::width(&line[..i]))
+                    .take(4)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(separators(&header), separators(&row), "{header}\n{row}");
+            assert!(header.trim_start().starts_with("Modified"));
+        }
+    }
+
+    #[test]
     fn scrolled_segments_preserve_text_after_horizontal_offset() {
         let rows = sample_rows();
-        let line = scrolled_segments(&metadata_segments(&rows[1], false), 14 + 19);
+        let line = scrolled_segments(&metadata_segments(&rows[1], false), 1 + MODIFIED_WIDTH + 3);
         let text = line
             .spans
             .into_iter()
@@ -1387,7 +1463,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('G')));
         render_at(&mut app, 100, 18);
         assert_eq!(app.selected_index(), Some(19));
-        assert_eq!(app.list_state.offset(), 7);
+        // One row of the pane is the column header.
+        assert_eq!(app.list_state.offset(), 8);
     }
 
     #[test]

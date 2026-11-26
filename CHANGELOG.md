@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.3
 
 - Order the session list by file modified time, newest first, and drop the
   session start date column. The modified time is shown as ISO 8601 UTC to

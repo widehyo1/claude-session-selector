@@ -37,6 +37,7 @@ not a shell command.
 | `0` | Reset metadata horizontal scroll. |
 | `/` | Start a search. |
 | `s` | Focus the header row to sort or filter by column; see [Sort and column filters](#sort-and-column-filters). |
+| `c` | Clear every column filter and the sort, keeping the global search. |
 | `i` | Show full metadata for the selected session; use `j` / `k`, `d` / `u`, or `g` / `G` to scroll and `i`, `Esc`, or `q` to close. |
 | `e` | Toggle initial Bash visibility for the next replay. |
 | `Enter` | Replay the selected session. |
@@ -120,6 +121,7 @@ the rows.
 | `h` / `l`, Left / Right | Focus the previous or next column. |
 | `Enter` | Sort by the column: descending, ascending, then the default order. |
 | `/` | Filter the column (not Modified). |
+| `c` | Clear every column filter and the sort; also works in the list. The global search is kept. |
 
 One column sorts at a time, case-insensitively and stably; rows without a
 value stay last. The default order is newest modified first, or relevance for

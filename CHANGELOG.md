@@ -10,7 +10,8 @@
 - Add a header row to the session list. `s` focuses it; `1`-`5` or `h` / `l`
   pick a column, `Enter` sorts by it (descending, ascending, default), and `/`
   filters Path, Branch, Repository, or Title by substring. Filters combine
-  with each other and with the global search.
+  with each other and with the global search. `c` clears every column filter
+  and the sort at once, keeping the global search.
 - `Esc` now cancels a search and restores the previous query instead of
   accepting it. In the list it clears the search, then the column filters,
   then the sort, and quits only when none is active; `q` still quits at once.

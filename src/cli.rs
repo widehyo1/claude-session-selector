@@ -261,6 +261,7 @@ Keys:
   /                              interactive search
   Tab                            switch pane focus; while searching, cycle any/content scope
   s                              focus the header: 1-5/h/l column, Enter sort, / column filter
+  c                              clear column filters and sort
   j/k or Up/Down                 move selection or scroll the focused message by one line
   d/u or Page keys               move selection or scroll the focused pane by half its height
   g/G or Home/End                first/last selection or message top/bottom (last line visible)

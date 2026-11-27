@@ -436,6 +436,18 @@ impl SelectorApp {
         true
     }
 
+    /// `c`: removes every column filter and returns to the default order.
+    /// The global search is kept.
+    fn clear_columns(&mut self) {
+        if self.sort.is_none() && self.column_filters.iter().all(String::is_empty) {
+            return;
+        }
+        let refilter = self.column_filters.iter().any(|filter| !filter.is_empty());
+        self.column_filters = Default::default();
+        self.sort = None;
+        self.apply_view(!refilter);
+    }
+
     fn handle_header_key(&mut self, key: KeyEvent) -> Option<SelectorAction> {
         match key.code {
             KeyCode::Char('q') => return Some(SelectorAction::Quit),
@@ -448,6 +460,7 @@ impl SelectorApp {
                 self.focus_column(Column::ALL[usize::from(ch as u8 - b'1')])
             }
             KeyCode::Enter => self.cycle_sort(self.header_column),
+            KeyCode::Char('c') => self.clear_columns(),
             KeyCode::Char('/') => {
                 if self.header_column.searchable() {
                     self.start_search(Mode::ColumnSearch(self.header_column));
@@ -674,6 +687,10 @@ impl SelectorApp {
                 }
                 KeyCode::Char('s') if key.modifiers.is_empty() => {
                     self.enter_header();
+                    None
+                }
+                KeyCode::Char('c') if key.modifiers.is_empty() => {
+                    self.clear_columns();
                     None
                 }
                 KeyCode::Enter => self.selected_path().map(SelectorAction::OpenReplay),
@@ -1057,6 +1074,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" h/l ←/→ move "),
             Span::raw(" Enter sort desc/asc/default "),
             Span::raw(" / filter column "),
+            Span::raw(" c clear "),
             Span::raw(" Esc/s/j back "),
             Span::raw(" q quit "),
             Span::raw(" ? help "),
@@ -1073,6 +1091,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Tab focus "),
             Span::raw(" / search "),
             Span::raw(" s header "),
+            Span::raw(" c clear "),
             Span::raw(" Enter replay "),
             Span::raw(" i details "),
             Span::raw(" e exec "),
@@ -1150,6 +1169,7 @@ fn render_help(frame: &mut Frame) {
         Line::raw("  h/l, Left/Right previous/next column"),
         Line::raw("  Enter           sort the column: desc -> asc -> default"),
         Line::raw("  /               filter Path/Branch/Repository/Title by substring"),
+        Line::raw("  c               clear all column filters and sort (also in the list)"),
         Line::raw(""),
         Line::raw("Search"),
         Line::raw("  /               interactive search"),
@@ -1822,6 +1842,47 @@ mod tests {
             app.handle_key(key(KeyCode::Esc)),
             Some(SelectorAction::Quit)
         );
+    }
+
+    #[test]
+    fn c_clears_filters_and_sort_but_keeps_the_global_search() {
+        let (_fixture, mut app) = header_app();
+        app.query = "kept".into();
+        app.column_filters[Column::Branch.index()] = "main".into();
+        app.column_filters[Column::Path.index()] = "beta".into();
+        app.sort = Some((Column::Path, SortDirection::Asc));
+        app.apply_view(false);
+        assert_eq!(paths(&app), ["1"]);
+
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.column_filters.iter().all(String::is_empty));
+        assert_eq!(app.sort, None);
+        assert_eq!(app.query, "kept");
+        assert_eq!(paths(&app), ["1", "2", "3"]);
+
+        // Also from the header; a sort-only clear keeps the selection.
+        app.list_state.select(Some(2));
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('2')));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.sort, None);
+        assert!(app.header_focus);
+        assert_eq!(
+            app.selected_row().unwrap().path,
+            PathBuf::from("/tmp/3.jsonl")
+        );
+    }
+
+    #[test]
+    fn c_is_search_text_while_filtering() {
+        let (_fixture, mut app) = header_app();
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('3')));
+        app.handle_key(key(KeyCode::Char('/')));
+        type_text(&mut app, "oc");
+        assert_eq!(app.column_filters[Column::Branch.index()], "oc");
+        assert_eq!(paths(&app), ["3"]);
     }
 
     #[test]

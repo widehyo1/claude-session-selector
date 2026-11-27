@@ -16,6 +16,8 @@
   accepting it. In the list it clears the search, then the column filters,
   then the sort, and quits only when none is active; `q` still quits at once.
 - Rename the `metadata` search target to `any`.
+- Show status messages such as `copied: …` after the badge legend. They were
+  appended to the key hints, which had grown past the terminal width.
 
 ## 0.3.2
 

@@ -1059,12 +1059,6 @@ fn message_text(message: &str) -> Text<'static> {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
-    let status = app
-        .status
-        .as_deref()
-        .map(|status| format!(" | {status}"))
-        .unwrap_or_default();
-
     let footer = match app.mode {
         Mode::Normal if app.header_focus => Line::from(vec![
             Span::raw(" focus: "),
@@ -1078,7 +1072,6 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Esc/s/j back "),
             Span::raw(" q quit "),
             Span::raw(" ? help "),
-            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
         Mode::Normal => Line::from(vec![
             Span::raw(" focus: "),
@@ -1101,7 +1094,6 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" Esc clear/quit "),
             Span::raw(" Ctrl-C quit "),
             Span::raw(" ? help "),
-            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
         Mode::Search => Line::from(vec![
             Span::raw(" search: "),
@@ -1109,7 +1101,6 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" /"),
             Span::styled(app.query.clone(), Style::default().fg(Color::Yellow)),
             Span::raw("  Tab target  Enter accept  Esc cancel  Ctrl-C quit  Backspace delete "),
-            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
         Mode::ColumnSearch(column) => Line::from(vec![
             Span::raw(" filter: "),
@@ -1120,7 +1111,6 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
                 Style::default().fg(Color::Yellow),
             ),
             Span::raw("  Enter accept (empty removes)  Esc cancel  Ctrl-C quit  Backspace delete "),
-            Span::styled(status, Style::default().fg(Color::Yellow)),
         ]),
     }
     .gray();
@@ -1134,6 +1124,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
         Span::styled(">", Style::default().fg(Color::Magenta)),
         Span::raw(" continued"),
     ]);
+    // The status shares the short legend line so the long key hints can't
+    // push it off screen.
+    let mut legend = legend;
+    if let Some(status) = app.status.as_deref() {
+        legend
+            .spans
+            .push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        legend.spans.push(Span::styled(
+            status.to_string(),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     frame.render_widget(Paragraph::new(vec![legend, footer]), area);
 }
 
@@ -1883,6 +1885,24 @@ mod tests {
         type_text(&mut app, "oc");
         assert_eq!(app.column_filters[Column::Branch.index()], "oc");
         assert_eq!(paths(&app), ["3"]);
+    }
+
+    #[test]
+    fn status_is_visible_on_the_legend_line_of_a_narrow_terminal() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.set_status("copied: cd '/repo' && claude --resume abc");
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let legend: String = (0..100)
+            .map(|x| buffer[(x, 10)].symbol().to_string())
+            .collect();
+        assert!(legend.starts_with(" badges: "), "{legend}");
+        assert!(
+            legend.contains("│ copied: cd '/repo' && claude --resume abc"),
+            "{legend}"
+        );
     }
 
     #[test]

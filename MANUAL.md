@@ -38,7 +38,7 @@ not a shell command.
 | `/` | Start a search. |
 | `s` | Focus the header row to sort or filter by column; see [Sort and column filters](#sort-and-column-filters). |
 | `c` | Clear every column filter and the sort, keeping the global search. |
-| `i` | Show full metadata for the selected session; use `j` / `k`, `d` / `u`, or `g` / `G` to scroll and `i`, `Esc`, or `q` to close. |
+| `i` | Show full metadata for the selected session; use `j` / `k`, `d` / `u`, or `g` / `G` to scroll, `e` to toggle exec visibility, and `i`, `Esc`, or `q` to close. |
 | `e` | Toggle initial Bash visibility for the next replay. |
 | `Enter` | Replay the selected session. |
 | `y` | Copy `cd '<cwd>' && claude --resume <session-id>`. |

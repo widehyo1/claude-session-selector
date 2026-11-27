@@ -18,6 +18,9 @@
 - Rename the `metadata` search target to `any`.
 - Show status messages such as `copied: …` after the badge legend. They were
   appended to the key hints, which had grown past the terminal width.
+- Trim the bottom key hints to the main keys, starting with `Enter detail`;
+  `i`, `e`, `p`, and Ctrl-C stay in `?` help. The `i` details popup shows the
+  exec visibility and toggles it with `e`.
 
 ## 0.3.2
 

@@ -635,6 +635,7 @@ impl SelectorApp {
         if self.show_details {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('i') | KeyCode::Char('q') => self.show_details = false,
+                KeyCode::Char('e') if key.modifiers.is_empty() => self.toggle_exec_visibility(),
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.details_scroll = self
                         .details_scroll
@@ -1077,6 +1078,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" focus: "),
             Span::styled(app.focus.label(), Style::default().fg(Color::Cyan)),
             Span::raw(" | "),
+            Span::raw(" Enter detail "),
             Span::raw(" j/k ↑/↓ move "),
             Span::raw(" d/u half-page "),
             Span::raw(" g/G first/last "),
@@ -1085,14 +1087,9 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &SelectorApp) {
             Span::raw(" / search "),
             Span::raw(" s header "),
             Span::raw(" c clear "),
-            Span::raw(" Enter replay "),
-            Span::raw(" i details "),
-            Span::raw(" e exec "),
             Span::raw(" y copy-resume "),
-            Span::raw(" p parent "),
             Span::raw(" q quit "),
             Span::raw(" Esc clear/quit "),
-            Span::raw(" Ctrl-C quit "),
             Span::raw(" ? help "),
         ]),
         Mode::Search => Line::from(vec![
@@ -1182,10 +1179,11 @@ fn render_help(frame: &mut Frame) {
         Line::raw(""),
         Line::raw("Other"),
         Line::raw("  i               show full metadata for the selected session"),
-        Line::raw("                  j/k, d/u, g/G scroll; i/Esc/q close"),
+        Line::raw("                  j/k, d/u, g/G scroll; e toggle exec; i/Esc/q close"),
         Line::raw("  Enter           replay the selected jsonl path"),
         Line::raw("                  return from replay to this selector when replay exits"),
         Line::raw("  e               toggle exec entries for the next replay"),
+        Line::raw("                  (also in the details popup; state shown on the top line)"),
         Line::raw("  y               copy `cd <cwd> && claude --resume <id>` to clipboard"),
         Line::raw("                  a subsession copies its parent session's command"),
         Line::raw("  p               select the parent session of a subsession"),
@@ -1225,7 +1223,10 @@ fn render_details(frame: &mut Frame, app: &mut SelectorApp) {
     let paragraph = paragraph
         .block(
             Block::new()
-                .title(" Session details (i/Esc/q close) ")
+                .title(format!(
+                    " Session details | exec: {}  e toggle  i/Esc/q close ",
+                    app.exec_visibility.label()
+                ))
                 .borders(Borders::ALL),
         )
         .scroll((app.details_scroll, 0));
@@ -1903,6 +1904,24 @@ mod tests {
             legend.contains("│ copied: cd '/repo' && claude --resume abc"),
             "{legend}"
         );
+    }
+
+    #[test]
+    fn e_toggles_exec_inside_the_details_popup_and_the_title_shows_it() {
+        let (_fixture, mut app) = sample_app(ExecVisibility::Hidden);
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(app.show_details);
+        assert_eq!(app.exec_visibility(), ExecVisibility::Shown);
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..20)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol().to_string())
+            .collect();
+        assert!(screen.contains("Session details | exec: shown  e toggle"));
     }
 
     #[test]
